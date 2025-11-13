@@ -15,6 +15,7 @@ huggingface/
 tmp/
 .empty/
 datasets/
+datasets/*
 configs/*
 
 # Byte-compiled / optimized / DLL files
