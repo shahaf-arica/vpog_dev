@@ -1,0 +1,35 @@
+name: gigapose
+channels:
+  - xformers
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - pip
+  - python=3.11.13
+  - pip:
+    - torch
+    - torchvision
+    - omegaconf
+    - torchmetrics
+    - fvcore
+    - iopath
+    - xformers
+    - opencv-python 
+    - pycocotools 
+    - matplotlib 
+    - onnxruntime 
+    - onnx
+    - scipy
+    - ffmpeg
+    - hydra-colorlog
+    - hydra-core
+    - gdown
+    - pytorch-lightning
+    - pandas
+    - ruamel.yaml
+    - pyrender
+    - wandb
+    - distinctipy
+    - blenderproc

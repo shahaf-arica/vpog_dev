@@ -3,6 +3,8 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from src.utils.logging import get_logger
+from huggingface_hub import hf_hub_download
+
 
 logger = get_logger(__name__)
 
@@ -10,11 +12,16 @@ logger = get_logger(__name__)
 def run_download(cfg_dataset: DictConfig) -> None:
     os.makedirs(cfg_dataset.local_dir, exist_ok=True)
     for key in ["rgb", "cad", "base"]:
-        tmp_dir = cfg_dataset.tmp / f"{cfg_dataset.name}_{key}.zip"
-        download_cmd = f"wget -O {tmp_dir} {cfg_dataset[key]} --no-check-certificate"
-        logger.info(f"Running {download_cmd}")
-        os.system(download_cmd)
-
+        # tmp_dir = cfg_dataset.tmp / f"{cfg_dataset.name}_{key}.zip"
+        tmp_dir = cfg_dataset.tmp / cfg_dataset[key]
+        hf_hub_download(
+            repo_id=f"bop-benchmark/{cfg_dataset.name}",
+            filename=cfg_dataset[key],
+            local_dir=str(cfg_dataset.tmp),
+            repo_type="dataset",
+            local_dir_use_symlinks=False
+        )
+        # unzip_cmd = f"unzip {tmp_dir} -d {cfg_dataset.local_dir}"
         unzip_cmd = f"unzip {tmp_dir} -d {cfg_dataset.local_dir}"
         if key == "base":
             unzip_cmd = unzip_cmd.replace("unzip", "unzip -j")
@@ -74,9 +81,12 @@ def download(cfg: DictConfig) -> None:
             prefix = "_primesense"
         else:
             prefix = ""
-        rgb_url = f"{cfg_data.source_url}/{dataset_name}_test{prefix}_bop19.zip"
-        cad_url = f"{cfg_data.source_url}/{dataset_name}_models.zip"
-        base_url = f"{cfg_data.source_url}/{dataset_name}_base.zip"
+        # rgb_url = f"{cfg_data.source_url}/{dataset_name}_test{prefix}_bop19.zip"
+        # cad_url = f"{cfg_data.source_url}/{dataset_name}_models.zip"
+        # base_url = f"{cfg_data.source_url}/{dataset_name}_base.zip"
+        rgb_url = f"{dataset_name}_test{prefix}_bop19.zip"
+        cad_url = f"{dataset_name}_models.zip"
+        base_url = f"{dataset_name}_base.zip"
         cfg_dataset = OmegaConf.create(
             {
                 "name": dataset_name,

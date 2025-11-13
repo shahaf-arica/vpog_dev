@@ -4,6 +4,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from src.utils.logging import get_logger
 
+
 logger = get_logger(__name__)
 
 
@@ -34,11 +35,13 @@ def download(cfg: DictConfig) -> None:
         "shapenet",
     ]:
         logger.info(f"Downloading {dataset_name}")
-        models_info_url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/{dataset_name}_models.json"
+        # models_info_url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/{dataset_name}_models.json"
+        models_info_url = f"{cfg_data.source_url}/megapose-{dataset_name}/{dataset_name}_models.json"
         models_info_path = (
             cfg_data.root_dir / dataset_name / "models_info.json"
         )
-        key_to_shard_url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/train_pbr_web/key_to_shard.json"
+        # key_to_shard_url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/train_pbr_web/key_to_shard.json"
+        key_to_shard_url = f"{cfg_data.source_url}/megapose-{dataset_name}/train_pbr_web/key_to_shard.json"
         key_to_shard_path = (
             cfg_data.root_dir / dataset_name / "key_to_shard.json"
         )

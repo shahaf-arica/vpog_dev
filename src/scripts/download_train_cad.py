@@ -22,7 +22,7 @@ def download(cfg: DictConfig) -> None:
     source_url = "https://www.paris.inria.fr/archive_ylabbeprojectsdata/megapose/tars/"
     metaData = {"gso": "google_scanned_objects", "shapenet": "shapenetcorev2"}
 
-    for dataset_name in ["shapenet"]:
+    for dataset_name in ["gso"]:
         local_dir = cfg_data.root_dir / f"{dataset_name}" / "models"
         os.makedirs(local_dir, exist_ok=True)
 

@@ -1,4 +1,4 @@
-wandb_api_key: 
+wandb_api_key: 1406504b35b50526e292c0bf229ab82c5525ed2a
 wandb_project_name: gigapose
-local_root_dir: ./gigaPose_datasets
+local_root_dir: ./
 slurm_root_dir: ./gigaPose_datasets

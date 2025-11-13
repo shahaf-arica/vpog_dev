@@ -6,9 +6,9 @@ defaults:
   - data: all
   - _self_
 
-save_dir: ${machine.root_dir}/results/${name_exp}
+save_dir: /strg/E/shared-data/Shahaf/gigapose
 name_exp: train
-use_pretrained: true 
+use_pretrained: false 
 
 train_dataset_id: 0 # 0 for gso, 1 for shapenet, 2 for both
 nets_to_train: all

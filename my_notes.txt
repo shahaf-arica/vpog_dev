@@ -1,0 +1,2 @@
+need to do (for pandas3d for template rendering):
+export MAIN_DIR=$HOME/gigapose

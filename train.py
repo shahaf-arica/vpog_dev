@@ -1,5 +1,8 @@
 import os
 
+import numpy as np
+np.nan
+
 os.environ["MPLCONFIGDIR"] = os.getcwd() + "./tmp/"
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -92,7 +95,7 @@ def run_train(cfg: DictConfig):
     trainer.fit(
         model,
         train_dataloaders=train_dataloaders,
-        val_dataloaders=val_dataloader,
+        # val_dataloaders=val_dataloader,
         # ckpt_path=cfg.model.checkpoint_path
         # if cfg.model.checkpoint_path is not None and cfg.use_pretrained
         # else None,
