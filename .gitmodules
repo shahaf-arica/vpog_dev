@@ -1,0 +1,6 @@
+[submodule "external/croco"]
+	path = external/croco
+	url = https://github.com/naver/croco.git
+[submodule "external/vggt"]
+	path = external/vggt
+	url = https://github.com/facebookresearch/vggt.git
