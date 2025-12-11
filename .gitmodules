@@ -4,3 +4,9 @@
 [submodule "external/vggt"]
 	path = external/vggt
 	url = https://github.com/facebookresearch/vggt.git
+[submodule "external/epropnp"]
+	path = external/epropnp
+	url = https://github.com/tjiiv-cprg/EPro-PnP-v2.git
+[submodule "external/dinov3"]
+	path = external/dinov3
+	url = https://github.com/facebookresearch/dinov3.git
