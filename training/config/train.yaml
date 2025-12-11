@@ -1,0 +1,26 @@
+# Main training configuration for VPOG
+defaults:
+  - machine: local
+  - data: vpog_data
+  - model: vpog_base
+  - _self_
+
+# Experiment settings
+save_dir: /strg/E/shared-data/Shahaf/gigapose/vpog_experiments
+name_exp: vpog_train
+seed: 42
+
+# Dataset selection: 0 for gso, 1 for shapenet, 2 for both
+train_dataset_id: 0
+
+# Training parameters
+max_epochs: 100
+log_every_n_steps: 50
+val_check_interval: 1.0
+
+# Checkpoint settings
+checkpoint_dir: ${save_dir}/${name_exp}/checkpoints
+vis_dir: ${save_dir}/${name_exp}/visualizations
+
+# Resume training
+resume_from_checkpoint: null

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.s2rope.s2rope_module import S2RoPE
+from vpog.models.s2rope.s2rope_module import S2RoPE
 
 
 # ---------------------------------------------------------------

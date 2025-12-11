@@ -1,0 +1,10 @@
+# configs/optimizer/adamw.yaml
+#
+# AdamW optimizer configuration
+
+name: 'adamw'
+lr: 1.0e-4
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+eps: 1.0e-8

@@ -40,6 +40,7 @@ class TemplateData:
     unique_id: Optional[int] = None
     TWO: Optional[List(Transform)] = None
     box_amodal: Optional[np.ndarray] = None  # (4, ) array [xmin, ymin, xmax, ymax]
+    diameter: Optional[float] = None  # Object diameter in mm (for depth correction)
 
     @staticmethod
     def from_dict(template_gt: DataJsonType) -> "TemplateData":

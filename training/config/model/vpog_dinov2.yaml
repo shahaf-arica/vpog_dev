@@ -1,0 +1,108 @@
+# VPOG Model Configuration with DINOv2 Encoder
+# Alternative configuration using DINOv2 instead of CroCo
+
+# Model parameters
+img_size: 224
+patch_size: 14  # DINOv2 uses 14x14 patches
+
+# Encoder configuration - DINOv2
+encoder:
+  _target_: vpog.models.encoder_wrapper.EncoderWrapper
+  encoder_type: dinov2
+  model_name: dinov2_vitl14  # 'dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'
+  pretrained: true
+  freeze_encoder: false
+  patch_size: 14
+  img_size: 224
+
+# Token Manager configuration
+token_manager:
+  _target_: vpog.models.token_manager.TokenManager
+  dim: 1024  # DINOv2-L: 1024-dim
+  num_query_added_tokens: 0
+  num_template_added_tokens: 1
+
+# AA Module configuration
+aa_module:
+  _target_: vpog.models.aa_module.AAModule
+  dim: 1024  # DINOv2-L: 1024-dim
+  depth: 6
+  num_heads: 16  # 16 heads for 1024-dim
+  mlp_ratio: 4.0
+  window_size: 7
+  qkv_bias: true
+  drop: 0.0  # Dropout rate
+  attn_drop: 0.0  # Attention dropout
+  drop_path_rate: 0.1  # Stochastic depth
+  use_global: true  # Use global attention
+  use_local: true  # Use local windowed attention
+  rope_freq: 100.0  # RoPE frequency
+  n_faces: 6  # S²RoPE faces
+  # S²RoPE dimension split for head_dim=64: D=2*(px+py+F*ps)=2*(10+10+6*2)=64
+  s2rope_px: 10
+  s2rope_py: 10
+  s2rope_ps: 2
+
+# S²RoPE configuration
+s2rope_config:
+  head_dim: 64  # 1024 / 16 heads = 64
+  n_faces: 6
+
+# Classification head configuration
+classification_head:
+  _target_: vpog.models.classification_head.ClassificationHead
+  dim: 1024
+  temperature: 1.0  # Softmax temperature for similarity scores
+  use_mlp: true
+  mlp_hidden_dim: 512
+  dropout: 0.0
+
+# Flow head configuration
+flow_head:
+  _target_: vpog.models.flow_head.FlowHead
+  dim: 1024
+  patch_size: 14  # Match DINOv2 patch_size
+  hidden_dims: [512, 256, 128]  # MLP decoder layers
+  use_confidence: true
+  dropout: 0.0
+
+# Training configuration
+training:
+  batch_size: 16
+  num_epochs: 100
+  num_workers: 8
+  
+  optimizer:
+    type: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+  
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  
+  loss_weights:
+    classification: 1.0
+    flow: 1.0
+    epro_pnp: 0.1
+    weight_regularization: 0.01
+
+# Inference configuration
+inference:
+  cluster_mode:
+    enabled: true
+    top_k: 4
+    confidence_threshold: 0.5
+  
+  global_mode:
+    enabled: true
+    chunk_size: 32
+    confidence_threshold: 0.5
+  
+  correspondence:
+    min_matches: 4
+    max_matches: 100
+    use_flow: true
+    flow_confidence_threshold: 0.5

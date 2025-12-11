@@ -1,0 +1,37 @@
+# configs/loss/default.yaml
+#
+# Default loss configuration for VPOG training
+
+# Loss weights
+weights:
+  classification: 1.0
+  flow: 1.0
+  regularization: 0.01
+  epro_pnp: 0.5
+
+# Classification loss
+classification:
+  tau: 1.0  # Temperature scaling
+  weight_unseen: 1.0  # Weight for unseen patches vs seen
+  label_smoothing: 0.0  # Label smoothing factor
+
+# Flow loss
+flow:
+  loss_type: 'l1'  # 'l1' or 'huber'
+  huber_delta: 1.0  # Delta for Huber loss (in patch units)
+  use_confidence_weighting: true
+  min_valid_pixels: 1
+
+# Weight regularization
+regularization:
+  weight_decay: 1.0e-4
+  exclude_bias: true
+  exclude_norm: true
+
+# EPro-PnP loss
+epro_pnp:
+  conf_threshold: 0.5
+  min_correspondences: 4
+  rotation_weight: 1.0
+  translation_weight: 1.0
+  use_epropnp: false  # Set to true when EPro-PnP is properly integrated

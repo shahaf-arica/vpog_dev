@@ -1,0 +1,37 @@
+# VPOG Training Data Configuration
+# Dataloader for VPOG training with GSO dataset
+
+dataloader:
+  _target_: training.dataloader.vpog_dataset.VPOGTrainDataset
+  root_dir: /data/home/ssaricha/gigapose/datasets
+  dataset_name: gso
+  batch_size: 2
+  depth_scale: 10.0
+  
+  # Template configuration
+  template_config:
+    dir: /data/home/ssaricha/gigapose/datasets/templates
+    level_templates: 1
+    pose_distribution: all
+    scale_factor: 10.0
+    num_templates: 162
+    pose_name: object_poses/OBJECT_ID.npy
+  
+  # Template selection
+  num_positive_templates: 3
+  num_negative_templates: 2
+  min_negative_angle_deg: 90.0
+  d_ref_random_ratio: 0.0
+  
+  # Image/patch settings
+  patch_size: 16
+  image_size: 224
+  
+  # Flow computation
+  flow_config:
+    compute_visibility: true
+    compute_patch_visibility: true
+    visibility_threshold: 0.1
+  
+  # Data augmentation (disabled for testing)
+  transforms: null

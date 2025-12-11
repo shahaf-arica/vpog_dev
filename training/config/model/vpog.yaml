@@ -1,0 +1,155 @@
+# VPOG Model Configuration
+# Configuration for Visual Patch-wise Object pose estimation with Groups of templates
+
+# Model parameters
+img_size: 224
+patch_size: 16
+
+# Encoder configuration - Hydra instantiation
+encoder:
+  _target_: vpog.models.encoder_wrapper.EncoderWrapper
+  encoder_type: croco  # 'croco' or 'dinov2'
+  checkpoint_name: large  # For CroCo: 'base' or 'large'
+  pretrained_path: null  # Auto-detects from checkpoints/ if null
+  freeze_encoder: false
+
+# Token Manager configuration - Hydra instantiation
+token_manager:
+  _target_: vpog.models.token_manager.TokenManager
+  dim: 1024  # Must match encoder output dim (1024 for large, 768 for base)
+  num_query_added_tokens: 0  # Currently no added tokens for query
+  num_template_added_tokens: 1  # 1 unseen token per template
+
+# AA Module configuration - Hydra instantiation
+aa_module:
+  _target_: vpog.models.aa_module.AAModule
+  dim: 1024  # Must match encoder output dim (1024 for large, 768 for base)
+  depth: 12  # Number of AA blocks
+  num_heads: 16  # 16 for Large (1024-dim), 12 for Base (768-dim)
+  mlp_ratio: 4.0  # MLP expansion ratio
+  window_size: 7  # Window size for local attention (7x7)
+  qkv_bias: true
+  drop: 0.0  # Dropout rate
+  attn_drop: 0.0  # Attention dropout
+  drop_path_rate: 0.1  # Stochastic depth
+  use_global: true  # Use global attention
+  use_local: true  # Use local windowed attention
+  rope_freq: 100.0  # RoPE frequency
+  n_faces: 6  # S²RoPE faces
+  # S²RoPE dimension split for head_dim=64: D=2*(px+py+F*ps)=2*(10+10+6*2)=64
+  # s2rope_px: 10
+  # s2rope_py: 10
+  # s2rope_ps: 2
+  # S²RoPE dimension split for head_dim=64: D=2*(px+py+F*ps)=2*(7+7+6*3)=64
+  s2rope_px: 7
+  s2rope_py: 7
+  s2rope_ps: 3
+
+# S²RoPE configuration
+s2rope_config:
+  head_dim: 64  # 1024 / 16 heads = 64
+  n_faces: 6
+
+# Classification head configuration - Hydra instantiation
+classification_head:
+  _target_: vpog.models.classification_head.ClassificationHead
+  dim: 1024  # Must match encoder output dim
+  temperature: 1.0  # Temperature for softmax
+  use_mlp: true  # Use MLP after projection
+  mlp_hidden_dim: 512  # Hidden dimension of MLP
+  dropout: 0.0  # Dropout rate
+
+# Flow head configuration - Hydra instantiation
+flow_head:
+  _target_: vpog.models.flow_head.FlowHead
+  dim: 1024  # Must match encoder output dim
+  patch_size: 16  # Match global patch_size
+  hidden_dims: [512, 256, 128]  # MLP decoder layers
+  use_confidence: true  # Predict confidence maps
+  dropout: 0.0  # Dropout rate
+
+# Training configuration
+training:
+  batch_size: 16
+  num_epochs: 100
+  num_workers: 8
+  
+  # Optimizer
+  optimizer:
+    type: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+  
+  # Learning rate scheduler
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  
+  # Loss weights
+  loss_weights:
+    classification: 1.0
+    flow: 1.0
+    epro_pnp: 0.1
+    weight_regularization: 0.01
+
+# Inference configuration
+inference:
+  # Cluster mode (top-K templates)
+  cluster_mode:
+    enabled: true
+    top_k: 4              # Use top-4 templates
+    confidence_threshold: 0.5
+  
+  # Global mode (all 162 templates)
+  global_mode:
+    enabled: true
+    chunk_size: 32        # Process templates in chunks
+    confidence_threshold: 0.5
+  
+  # Correspondence construction
+  correspondence:
+    min_matches: 4        # Minimum matches for EPro-PnP
+    max_matches: 100      # Maximum matches to use
+    use_flow: true        # Use flow for refinement
+    flow_confidence_threshold: 0.5
+
+# Data configuration
+data:
+  # Dataset
+  dataset_name: "gso"     # or "bop", "megapose"
+  dataset_path: "datasets/gso"
+  
+  # Templates
+  num_templates: 162      # Total number of templates
+  template_selection: "farthest_point"  # or "uniform", "icosphere"
+  
+  # Augmentation
+  augmentation:
+    enabled: true
+    color_jitter: 0.2
+    random_crop: false
+    random_flip: false
+
+# Hardware configuration
+hardware:
+  device: "cuda"
+  mixed_precision: true   # Use AMP for faster training
+  compile: false          # Use torch.compile (PyTorch 2.0+)
+
+# Logging configuration
+logging:
+  wandb:
+    enabled: true
+    project: "vpog"
+    entity: null
+  
+  checkpoint:
+    save_top_k: 3
+    monitor: "val/pose_error"
+    mode: "min"
+  
+  visualization:
+    enabled: true
+    log_every_n_steps: 100

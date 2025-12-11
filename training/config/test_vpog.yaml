@@ -1,0 +1,13 @@
+# Test configuration for VPOG full pipeline test
+# This extends the base vpog.yaml config for testing
+
+defaults:
+  - model/vpog
+
+# Test-specific overrides
+test:
+  use_real_data: false  # Use synthetic data by default
+  batch_size: 2
+  num_templates: 5
+  device: cuda
+  output_dir: ./tmp/vpog_full_pipeline_test

@@ -1,0 +1,31 @@
+# Local machine configuration
+name: local
+
+# Hardware settings
+batch_size: 8
+num_workers: 8
+gpus: 1
+
+# Root directory
+root_dir: /data/home/ssaricha/gigapose
+
+# PyTorch Lightning Trainer settings
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: ${machine.gpus}
+  max_epochs: ${max_epochs}
+  log_every_n_steps: ${log_every_n_steps}
+  val_check_interval: ${val_check_interval}
+  precision: 16-mixed  # Use mixed precision training
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  
+  # Callbacks will be added programmatically
+  callbacks: []
+  
+  # Logging
+  logger: true
+  enable_checkpointing: true
+  enable_progress_bar: true
+  enable_model_summary: true

@@ -1,0 +1,38 @@
+# SLURM cluster configuration for DDP training
+name: slurm
+
+# Hardware settings
+batch_size: 8  # per GPU
+num_workers: 8  # per GPU
+gpus: 4  # number of GPUs
+nodes: 1  # number of nodes
+
+# Root directory (adjust for your cluster)
+root_dir: /strg/E/shared-data/Shahaf/gigapose
+
+# PyTorch Lightning Trainer settings for DDP
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: ${machine.gpus}
+  num_nodes: ${machine.nodes}
+  strategy: ddp  # Distributed Data Parallel
+  max_epochs: ${max_epochs}
+  log_every_n_steps: ${log_every_n_steps}
+  val_check_interval: ${val_check_interval}
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  
+  # Callbacks will be added programmatically
+  callbacks: []
+  
+  # Logging
+  logger: true
+  enable_checkpointing: true
+  enable_progress_bar: true
+  enable_model_summary: true
+  
+  # DDP settings
+  sync_batchnorm: true
+  replace_sampler_ddp: true

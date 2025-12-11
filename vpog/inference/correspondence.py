@@ -1,0 +1,318 @@
+# vpog/inference/correspondence.py
+#
+# Correspondence construction from VPOG predictions
+#
+# Converts classification logits + flow predictions to 2D-3D correspondences
+# for EPro-PnP pose estimation
+#
+# Input:
+#   - classification_logits: [B, S, Nq, Nt+num_added] - template matching scores
+#   - flow: [B, S, Nq, Nt, 16, 16, 2] - pixel-level flow predictions (patch units)
+#   - confidence: [B, S, Nq, Nt, 16, 16] - flow confidence [0, 1]
+#   - query_data: dict with 2D patch positions and image info
+#   - template_data: dict with 3D patch positions and mesh info
+#
+# Output:
+#   - pts2d: [N, 2] - 2D pixel coordinates
+#   - pts3d: [N, 3] - 3D model coordinates
+#   - weights: [N] - correspondence weights (confidence)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Tuple, Optional
+
+
+class CorrespondenceBuilder(nn.Module):
+    """
+    Build 2D-3D correspondences from VPOG predictions.
+    
+    Converts classification + flow predictions into weighted correspondences
+    for PnP pose estimation.
+    """
+    
+    def __init__(
+        self,
+        patch_size: int = 16,
+        conf_threshold: float = 0.5,
+        top_k_templates: Optional[int] = None,
+        soft_matching: bool = False,
+        use_pixel_level: bool = True,
+    ):
+        """
+        Args:
+            patch_size: Patch size in pixels (default 16)
+            conf_threshold: Minimum confidence for correspondence (default 0.5)
+            top_k_templates: Use top-k template matches per query (None = argmax)
+            soft_matching: Use soft matching weights from classification (default False)
+            use_pixel_level: Use pixel-level flow, else patch-level (default True)
+        """
+        super().__init__()
+        self.patch_size = patch_size
+        self.conf_threshold = conf_threshold
+        self.top_k_templates = top_k_templates
+        self.soft_matching = soft_matching
+        self.use_pixel_level = use_pixel_level
+    
+    def forward(
+        self,
+        classification_logits: torch.Tensor,
+        flow: torch.Tensor,
+        confidence: torch.Tensor,
+        query_data: dict,
+        template_data: dict,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build correspondences from predictions.
+        
+        Args:
+            classification_logits: [B, S, Nq, Nt+num_added] - matching scores
+            flow: [B, S, Nq, Nt, 16, 16, 2] - flow predictions (patch units)
+            confidence: [B, S, Nq, Nt, 16, 16] - flow confidence
+            query_data: dict with 'positions' [B, S, Nq, 2], 'image_size', etc.
+            template_data: dict with 'xyz' [B, S, Nt, 16, 16, 3], etc.
+        
+        Returns:
+            dict with:
+                'pts2d': [N, 2] - 2D pixel coordinates
+                'pts3d': [N, 3] - 3D model coordinates
+                'weights': [N] - correspondence weights
+                'num_correspondences': int
+        """
+        B, S, Nq, Nt_plus = classification_logits.shape
+        Nt = flow.shape[3]
+        
+        # Exclude added tokens from classification
+        cls_logits = classification_logits[:, :, :, :Nt]  # [B, S, Nq, Nt]
+        
+        # Get template matches
+        if self.soft_matching:
+            # Soft matching: use softmax probabilities
+            match_weights = F.softmax(cls_logits, dim=-1)  # [B, S, Nq, Nt]
+        else:
+            # Hard matching: argmax
+            match_indices = cls_logits.argmax(dim=-1)  # [B, S, Nq]
+            match_weights = F.one_hot(match_indices, num_classes=Nt).float()  # [B, S, Nq, Nt]
+        
+        # Apply top-k filtering if requested
+        if self.top_k_templates is not None and self.top_k_templates < Nt:
+            top_k_values, top_k_indices = torch.topk(
+                cls_logits, k=self.top_k_templates, dim=-1
+            )  # [B, S, Nq, k]
+            
+            # Create mask for top-k
+            top_k_mask = torch.zeros_like(match_weights)
+            top_k_mask.scatter_(-1, top_k_indices, 1.0)
+            match_weights = match_weights * top_k_mask
+        
+        # Build correspondences
+        if self.use_pixel_level:
+            correspondences = self._build_pixel_level_correspondences(
+                match_weights,
+                flow,
+                confidence,
+                query_data,
+                template_data,
+            )
+        else:
+            correspondences = self._build_patch_level_correspondences(
+                match_weights,
+                flow,
+                confidence,
+                query_data,
+                template_data,
+            )
+        
+        return correspondences
+    
+    def _build_pixel_level_correspondences(
+        self,
+        match_weights: torch.Tensor,
+        flow: torch.Tensor,
+        confidence: torch.Tensor,
+        query_data: dict,
+        template_data: dict,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build pixel-level correspondences (16x16 per patch match).
+        
+        Returns:
+            dict with 'pts2d', 'pts3d', 'weights'
+        """
+        B, S, Nq, Nt = match_weights.shape
+        
+        # Extract query patch positions [B, S, Nq, 2] (patch coordinates)
+        query_positions = query_data['positions']  # [B, S, Nq, 2]
+        
+        # Extract template 3D coordinates [B, S, Nt, 16, 16, 3]
+        template_xyz = template_data['xyz']  # [B, S, Nt, 16, 16, 3]
+        
+        pts2d_list = []
+        pts3d_list = []
+        weights_list = []
+        
+        # Process each batch and sequence
+        for b in range(B):
+            for s in range(S):
+                # Process each query patch
+                for q in range(Nq):
+                    # Get query patch position (top-left corner in patch coordinates)
+                    qy, qx = query_positions[b, s, q]  # Patch coordinates
+                    
+                    # Convert to pixel coordinates
+                    qy_pix = qy * self.patch_size
+                    qx_pix = qx * self.patch_size
+                    
+                    # Process each template that has non-zero weight
+                    for t in range(Nt):
+                        w_match = match_weights[b, s, q, t].item()
+                        if w_match < 1e-6:
+                            continue
+                        
+                        # Get flow and confidence for this patch pair
+                        flow_qt = flow[b, s, q, t]  # [16, 16, 2]
+                        conf_qt = confidence[b, s, q, t]  # [16, 16]
+                        
+                        # Get template 3D points
+                        xyz_t = template_xyz[b, s, t]  # [16, 16, 3]
+                        
+                        # Process each pixel in the patch
+                        for i in range(16):
+                            for j in range(16):
+                                # Check confidence threshold
+                                if conf_qt[i, j] < self.conf_threshold:
+                                    continue
+                                
+                                # Query 2D position (pixel coordinates)
+                                # Pixel (i, j) in patch -> absolute pixel position
+                                y_2d = qy_pix + i
+                                x_2d = qx_pix + j
+                                
+                                # Apply flow to refine 2D position
+                                # flow is in patch units, convert to pixels
+                                flow_y = flow_qt[i, j, 0] * self.patch_size
+                                flow_x = flow_qt[i, j, 1] * self.patch_size
+                                
+                                y_2d_refined = y_2d + flow_y
+                                x_2d_refined = x_2d + flow_x
+                                
+                                # Template 3D position
+                                xyz_3d = xyz_t[i, j]  # [3]
+                                
+                                # Combined weight (classification * confidence)
+                                weight = w_match * conf_qt[i, j].item()
+                                
+                                # Add correspondence
+                                pts2d_list.append([x_2d_refined.item(), y_2d_refined.item()])
+                                pts3d_list.append(xyz_3d.cpu().tolist())
+                                weights_list.append(weight)
+        
+        # Convert to tensors
+        if len(pts2d_list) == 0:
+            # No correspondences found
+            device = flow.device
+            return {
+                'pts2d': torch.empty(0, 2, device=device),
+                'pts3d': torch.empty(0, 3, device=device),
+                'weights': torch.empty(0, device=device),
+                'num_correspondences': 0,
+            }
+        
+        pts2d = torch.tensor(pts2d_list, dtype=flow.dtype, device=flow.device)
+        pts3d = torch.tensor(pts3d_list, dtype=flow.dtype, device=flow.device)
+        weights = torch.tensor(weights_list, dtype=flow.dtype, device=flow.device)
+        
+        return {
+            'pts2d': pts2d,
+            'pts3d': pts3d,
+            'weights': weights,
+            'num_correspondences': len(pts2d_list),
+        }
+    
+    def _build_patch_level_correspondences(
+        self,
+        match_weights: torch.Tensor,
+        flow: torch.Tensor,
+        confidence: torch.Tensor,
+        query_data: dict,
+        template_data: dict,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build patch-level correspondences (one per patch match).
+        
+        Uses mean flow and confidence per patch.
+        """
+        B, S, Nq, Nt = match_weights.shape
+        
+        # Extract query patch positions
+        query_positions = query_data['positions']  # [B, S, Nq, 2]
+        
+        # Extract template 3D coordinates and compute centers
+        template_xyz = template_data['xyz']  # [B, S, Nt, 16, 16, 3]
+        template_centers = template_xyz.mean(dim=(-3, -2))  # [B, S, Nt, 3]
+        
+        pts2d_list = []
+        pts3d_list = []
+        weights_list = []
+        
+        # Process each batch and sequence
+        for b in range(B):
+            for s in range(S):
+                for q in range(Nq):
+                    # Get query patch center
+                    qy, qx = query_positions[b, s, q]
+                    qy_pix = (qy + 0.5) * self.patch_size
+                    qx_pix = (qx + 0.5) * self.patch_size
+                    
+                    for t in range(Nt):
+                        w_match = match_weights[b, s, q, t].item()
+                        if w_match < 1e-6:
+                            continue
+                        
+                        # Mean flow and confidence for this patch
+                        flow_qt = flow[b, s, q, t]  # [16, 16, 2]
+                        conf_qt = confidence[b, s, q, t]  # [16, 16]
+                        
+                        mean_conf = conf_qt.mean().item()
+                        if mean_conf < self.conf_threshold:
+                            continue
+                        
+                        mean_flow = flow_qt.mean(dim=(0, 1))  # [2]
+                        
+                        # Apply mean flow
+                        flow_y = mean_flow[0] * self.patch_size
+                        flow_x = mean_flow[1] * self.patch_size
+                        
+                        y_2d = qy_pix + flow_y.item()
+                        x_2d = qx_pix + flow_x.item()
+                        
+                        # Template 3D center
+                        xyz_3d = template_centers[b, s, t]  # [3]
+                        
+                        # Combined weight
+                        weight = w_match * mean_conf
+                        
+                        pts2d_list.append([x_2d, y_2d])
+                        pts3d_list.append(xyz_3d.cpu().tolist())
+                        weights_list.append(weight)
+        
+        # Convert to tensors
+        if len(pts2d_list) == 0:
+            device = flow.device
+            return {
+                'pts2d': torch.empty(0, 2, device=device),
+                'pts3d': torch.empty(0, 3, device=device),
+                'weights': torch.empty(0, device=device),
+                'num_correspondences': 0,
+            }
+        
+        pts2d = torch.tensor(pts2d_list, dtype=flow.dtype, device=flow.device)
+        pts3d = torch.tensor(pts3d_list, dtype=flow.dtype, device=flow.device)
+        weights = torch.tensor(weights_list, dtype=flow.dtype, device=flow.device)
+        
+        return {
+            'pts2d': pts2d,
+            'pts3d': pts3d,
+            'weights': weights,
+            'num_correspondences': len(pts2d_list),
+        }

@@ -142,6 +142,10 @@ def render(cfg) -> None:
         if diameter == -1:
             continue
         obj_id = model_info["obj_id"]
+        ############# for debug #############
+        if obj_id != 733:
+            continue
+        ####################################
         cad_path = osp.join(
             cad_dir,
             "models_normalized",
