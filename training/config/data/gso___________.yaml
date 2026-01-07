@@ -1,0 +1,35 @@
+# GSO (Google Scanned Objects) Training Dataset Configuration
+
+name: gso
+root_dir: ${machine.root_dir}/datasets
+
+dataloader:
+  _target_: training.dataloader.vpog_dataset.VPOGDataset
+  mode: train
+  root_dir: ${data_train.root_dir}
+  dataset_name: gso
+  depth_scale: 10.0
+  
+  # Template configuration
+  template_config:
+    dir: ${data_train.root_dir}/templates
+    level_templates: 1
+    pose_distribution: all
+    scale_factor: 10.0
+    num_templates: 162
+    pose_name: object_poses/OBJECT_ID.npy
+  
+  # Template selection
+  num_positive_templates: 3
+  num_negative_templates: 2
+  min_negative_angle_deg: 90.0
+  
+  # Image/patch settings
+  patch_size: 16
+  image_size: 224
+  
+  # Data augmentation
+  enable_augmentation: true
+  
+  # Random seed for reproducibility
+  seed: ${seed}

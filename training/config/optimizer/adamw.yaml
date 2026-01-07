@@ -1,0 +1,39 @@
+# AdamW Optimizer Configuration with Parameter Groups
+# Supports different learning rates for backbone vs new components
+
+# Base learning rate
+lr: 1.0e-4
+
+# Weight decay
+weight_decay: 1.0e-2
+
+# Betas for AdamW
+betas: [0.9, 0.999]
+
+# Parameter groups with different learning rates
+# This allows training backbone (CroCo encoder) with lower LR
+# and new components (AA module + heads) with higher LR
+use_param_groups: true
+
+param_groups:
+  # Backbone (CroCo encoder) - lower learning rate
+  backbone:
+    lr_multiplier: 0.1  # 10x lower LR for pretrained backbone
+    components:
+      - croco_encoder
+      - enc
+  
+  # New components (AA + heads) - full learning rate  
+  new_components:
+    lr_multiplier: 1.0
+    components:
+      - aa_module
+      - cross_attention
+      - classification_head
+      - flow_head
+
+# Warmup settings
+warmup:
+  enabled: true
+  steps: 1000
+  start_lr_ratio: 0.01  # Start from 1% of target LR

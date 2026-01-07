@@ -1,0 +1,12 @@
+# CroCo-V2 Large Encoder Configuration
+_target_: vpog.models.encoder_wrapper.EncoderWrapper
+encoder_type: croco
+checkpoint_name: large
+pretrained_path: ${oc.env:HOME}/gigapose/checkpoints/CroCo_V2_ViTLarge_BaseDecoder.pth
+freeze_encoder: false
+
+# Architecture specs (for reference, auto-detected from checkpoint)
+# embed_dim: 1024
+# depth: 24
+# num_heads: 16
+# patch_size: 16

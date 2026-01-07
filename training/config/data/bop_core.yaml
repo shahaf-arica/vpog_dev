@@ -1,0 +1,35 @@
+# Generic BOP Dataset Validation Configuration
+# Works with any BOP dataset: ycbv, tless, lmo, itodd, hb, icbin, tudl, etc.
+# Override dataset_name in train.yaml or command line:
+#   python training/train.py val_dataset_name=tless
+
+root_dir: ${machine.root_dir}/datasets
+
+dataloader:
+  _target_: training.dataloader.vpog_dataset.VPOGDataset
+  mode: val
+  root_dir: ${data_val.root_dir}
+  dataset_name: ycbv  # Override via val_dataset_name in train.yaml
+  depth_scale: 10.0
+  
+  # Template configuration
+  template_config:
+    dir: ${data_val.root_dir}/templates
+    level_templates: 1
+    pose_distribution: all
+    scale_factor: 1.0  # BOP uses meters, not mm scale
+    num_templates: 162
+    image_name: OBJECT_ID/VIEW_ID.png
+    pose_name: object_poses/OBJECT_ID.npy
+  
+  # Template selection
+  num_positive_templates: 8
+  num_negative_templates: 0
+  
+  # Image/patch settings
+  patch_size: 16
+  image_size: 224
+  
+  # Validation settings
+  test_setting: localization
+  load_gt: true

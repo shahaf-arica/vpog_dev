@@ -1,0 +1,63 @@
+# VPOG Data Configuration
+defaults:
+  - transforms  # Import transform configurations from transforms.yaml
+
+root_dir: ${machine.root_dir}/datasets/
+
+# Dataloader configuration
+dataloader:
+  _target_: training.dataloader.vpog_dataset.VPOGDataset
+  mode: train  # 'train' or 'val'
+  
+  # Dataset settings
+  dataset_name: gso  # 'gso' or 'shapenet'
+  root_dir: ${root_dir}
+  depth_scale: 10.0
+  
+  # Template configuration
+  template_config:
+    dir: ${root_dir}templates
+    level_templates: 1
+    pose_distribution: all
+    scale_factor: 10.0
+    num_templates: 162
+    image_name: OBJECT_ID/VIEW_ID.png
+    pose_name: object_poses/OBJECT_ID.npy
+  
+  # Template selection settings
+  num_positive_templates: 4  # S_p: nearest out-of-plane templates
+  num_negative_templates: 2  # S_n: random negative templates
+  min_negative_angle_deg: 90.0  # minimum angle difference for negatives
+  d_ref_random_ratio: 0.0  # ratio of random d_ref vs nearest (0.0 = always nearest)
+  positive_sampling_mode: nearest  # 'nearest' or 'random_within_range'
+  positive_sampling_deg_range: 30.0  # deg range for random sampling mode
+  seed: 42  # random seed for reproducibility (null = no seed)
+  
+  # Patch settings
+  patch_size: 16  # CroCo default patch size
+  image_size: 224  # input image size
+  
+  # Flow computation settings
+  flow_config:
+    compute_visibility: true
+    compute_patch_visibility: true  # check if flow stays within patch
+    visibility_threshold: 0.1  # minimum visibility fraction
+  
+  # Augmentation settings (imported from transforms.yaml via defaults)
+  transforms:
+    normalize: ${normalize}
+    crop_transform: ${crop_transform}
+    rgb_transform: ${rgb_transform}
+    rgb_augmentation: ${rgb_augmentation}
+    inplane_augmentation: ${inplane_augmentation}
+  
+  # Dataloader settings
+  batch_size: ${machine.batch_size}
+  num_workers: ${machine.num_workers}
+
+# Visualization settings for debugging
+visualization:
+  enabled: false  # Set to true to save visualizations
+  save_dir: ${vis_dir}
+  save_frequency: 100  # Save every N batches
+  max_samples_per_batch: 4  # Max samples to visualize per batch

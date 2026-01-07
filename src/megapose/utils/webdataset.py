@@ -36,6 +36,12 @@ def group_by_keys(data, keys=base_plus_ext, lcase=True, suffixes=None, handler=N
     current_sample = None
     for filesample in data:
         assert isinstance(filesample, dict)
+        
+        # Skip entries without required keys (tar padding/end-of-file markers)
+        # This is expected behavior - see https://github.com/nv-nguyen/gigapose/issues/26
+        if "fname" not in filesample or "data" not in filesample:
+            continue
+            
         fname, value = filesample["fname"], filesample["data"]
         prefix, suffix = keys(fname)
         if trace:

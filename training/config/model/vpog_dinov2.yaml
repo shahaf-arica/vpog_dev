@@ -1,52 +1,20 @@
-# VPOG Model Configuration with DINOv2 Encoder
-# Alternative configuration using DINOv2 instead of CroCo
+# VPOG Model with DINOv2 ViT-L/14 Encoder
+defaults:
+  - vpog
+  - encoder: dinov2_vitl14
+  - _self_
 
-# Model parameters
-img_size: 224
-patch_size: 14  # DINOv2 uses 14x14 patches
+# Override patch_size for DINOv2 (uses 14x14 patches)
+patch_size: 14
 
-# Encoder configuration - DINOv2
-encoder:
-  _target_: vpog.models.encoder_wrapper.EncoderWrapper
-  encoder_type: dinov2
-  model_name: dinov2_vitl14  # 'dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'
-  pretrained: true
-  freeze_encoder: false
-  patch_size: 14
-  img_size: 224
+# Component dimensions stay at 1024 (DINOv2-L has same dim as CroCo-Large)
+# No need to override aa_module, classification_head, flow_head
 
-# Token Manager configuration
-token_manager:
-  _target_: vpog.models.token_manager.TokenManager
-  dim: 1024  # DINOv2-L: 1024-dim
-  num_query_added_tokens: 0
-  num_template_added_tokens: 1
+# Override flow head patch size
+flow_head:
+  cfg:
+    ps: 14
 
-# AA Module configuration
-aa_module:
-  _target_: vpog.models.aa_module.AAModule
-  dim: 1024  # DINOv2-L: 1024-dim
-  depth: 6
-  num_heads: 16  # 16 heads for 1024-dim
-  mlp_ratio: 4.0
-  window_size: 7
-  qkv_bias: true
-  drop: 0.0  # Dropout rate
-  attn_drop: 0.0  # Attention dropout
-  drop_path_rate: 0.1  # Stochastic depth
-  use_global: true  # Use global attention
-  use_local: true  # Use local windowed attention
-  rope_freq: 100.0  # RoPE frequency
-  n_faces: 6  # S²RoPE faces
-  # S²RoPE dimension split for head_dim=64: D=2*(px+py+F*ps)=2*(10+10+6*2)=64
-  s2rope_px: 10
-  s2rope_py: 10
-  s2rope_ps: 2
-
-# S²RoPE configuration
-s2rope_config:
-  head_dim: 64  # 1024 / 16 heads = 64
-  n_faces: 6
 
 # Classification head configuration
 classification_head:

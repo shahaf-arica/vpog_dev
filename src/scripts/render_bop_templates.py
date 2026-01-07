@@ -70,12 +70,12 @@ def render(cfg) -> None:
     template_poses[:, :3, 3] *= 0.4  # zoom to object
     bop23_datasets = [
         "lmo",
-        "tless",
-        "tudl",
-        "icbin",
-        "itodd",
-        "hb",
-        "ycbv",
+        # "tless",
+        # "tudl",
+        # "icbin",
+        # "itodd",
+        # "hb",
+        # "ycbv",
     ]
     if cfg.test_dataset_name is None:
         datasets = bop23_datasets

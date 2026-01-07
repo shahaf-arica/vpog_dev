@@ -35,7 +35,10 @@ from bop_toolkit_lib import inout
 
 # VPOG imports
 from training.dataloader.template_selector import TemplateSelector, extract_d_ref_from_pose
-from training.dataloader.flow_computer import FlowComputer
+from training.dataloader.object_index_builder import load_object_index
+from training.dataloader.object_level_wrapper import ObjectLevelDataset
+from training.dataloader import vpog_visualizations as viz
+# from training.dataloader.flow_computer import FlowComputer
 
 logger = get_logger(__name__)
 
@@ -54,7 +57,7 @@ class VPOGBatch:
     template_types: torch.Tensor         # [B, S]
 
     # Existing supervision
-    flows: torch.Tensor                  # [B, S, H_p, W_p, 2]
+    coarse_flows: torch.Tensor                  # [B, S, H_p, W_p, 2]
     visibility: torch.Tensor             # [B, S, H_p, W_p]
     patch_visibility: torch.Tensor       # [B, S, H_p, W_p]
 
@@ -66,7 +69,7 @@ class VPOGBatch:
 
     # NEW: dense flow and weights (template→query, in query-patch coords)
     dense_flow: torch.Tensor             # [B, S, H_p, W_p, ps, ps, 2]
-    dense_weight: torch.Tensor           # [B, S, H_p, W_p, ps, ps]
+    dense_visibility: torch.Tensor           # [B, S, H_p, W_p, ps, ps]
 
     # Metadata / extras
     infos: object
@@ -86,26 +89,26 @@ class VPOGBatch:
             d_ref=self.d_ref.to(device),
             template_indices=self.template_indices.to(device),
             template_types=self.template_types.to(device),
-            flows=self.flows.to(device),
+            coarse_flows=self.coarse_flows.to(device),
             visibility=self.visibility.to(device),
             patch_visibility=self.patch_visibility.to(device),
             patch_cls=self.patch_cls.to(device),
             dense_flow=self.dense_flow.to(device),
-            dense_weight=self.dense_weight.to(device),
-            infos=self.infos,  # usually small / non-tensor, keep as-is
-            full_rgb=self.full_rgb.to(device) if self.full_rgb is not None else None,
-            centered_rgb=self.centered_rgb.to(device) if self.centered_rgb is not None else None,
-            bboxes=self.bboxes.to(device) if self.bboxes is not None else None,
-            query_depth=self.query_depth.to(device) if self.query_depth is not None else None,
-            template_depth=self.template_depth.to(device) if self.template_depth is not None else None,
+            dense_visibility=self.dense_visibility.to(device),
+            infos=self.infos,
+            full_rgb=self.full_rgb if self.full_rgb is not None else None,
+            centered_rgb=self.centered_rgb if self.centered_rgb is not None else None,
+            bboxes=self.bboxes if self.bboxes is not None else None,
+            query_depth=self.query_depth if self.query_depth is not None else None,
+            template_depth=self.template_depth if self.template_depth is not None else None,
         )
 
 
 
 
-class VPOGTrainDataset:
+class VPOGDataset:
     """
-    VPOG Training Dataset
+    VPOG Dataset for both training and validation
     
     For each query:
     1. Load query image and GT pose
@@ -113,6 +116,10 @@ class VPOGTrainDataset:
     3. Extract d_ref from nearest template
     4. Compute flow labels between templates and query
     5. Return batch in format [B, S+1, C, H, W]
+    
+    Modes:
+    - 'train': Training split with augmentation and random template selection
+    - 'val': Validation split without augmentation and deterministic template selection
     """
     
     def __init__(
@@ -120,28 +127,32 @@ class VPOGTrainDataset:
         root_dir: str,
         dataset_name: str,
         template_config: Dict,
+        mode: str = 'train',
+        split: Optional[str] = None,
         num_positive_templates: int = 4,
         num_negative_templates: int = 0,
         min_negative_angle_deg: float = 90.0,
-        d_ref_random_ratio: float = 0.0,
+        d_ref_random_ratio: Optional[float] = None,
         patch_size: int = 16,
         image_size: int = 224,
         flow_config: Optional[Dict] = None,
         transforms: Optional[Dict] = None,
-        batch_size: int = 8,
         depth_scale: float = 10.0,
+        depth_tolerance: float = 5.0,
         seed: Optional[int] = None,
         **kwargs,
     ):
         """
         Args:
             root_dir: Root directory for datasets
-            dataset_name: 'gso' or 'shapenet'
+            dataset_name: Dataset name (e.g., 'gso', 'shapenet', 'ycbv', 'tless', 'lmo')
             template_config: Configuration for template dataset
+            mode: 'train' or 'val' - determines split, augmentation, and template selection
+            split: Data split to use (e.g., 'train_pbr', 'test', 'val'). Auto-detected from mode if None
             num_positive_templates: S_p - number of nearest templates
             num_negative_templates: S_n - number of random negative templates
             min_negative_angle_deg: Minimum angle for negative templates
-            d_ref_random_ratio: Ratio of random vs nearest d_ref selection
+            d_ref_random_ratio: Ratio of random vs nearest d_ref selection (None = auto: 0.0 for train, 0.0 for val)
             patch_size: Size of patches (default 16 for CroCo)
             image_size: Input image size
             flow_config: Configuration for flow computation
@@ -150,20 +161,24 @@ class VPOGTrainDataset:
             depth_scale: Depth scale factor
             seed: Random seed for reproducibility (None = no fixed seed)
         """
-        self.batch_size = batch_size
+        # Validate mode
+        assert mode in ['train', 'val'], f"mode must be 'train' or 'val', got {mode}"
+        
+        self.mode = mode
         self.dataset_name = dataset_name
         self.dataset_dir = Path(root_dir) / dataset_name
         self.transforms = transforms if transforms is not None else {}
         self.patch_size = patch_size
         self.image_size = image_size
         self.depth_scale = depth_scale
+        self.depth_tolerance = depth_tolerance
         self.seed = seed
         
         # Number of patches
         self.num_patches_per_side = image_size // patch_size
         self.num_patches = self.num_patches_per_side ** 2
         
-        logger.info(f"Initializing VPOGTrainDataset for {dataset_name}")
+        logger.info(f"Initializing VPOGDataset for {dataset_name} (mode={mode})")
         logger.info(f"  Image size: {image_size}, Patch size: {patch_size}")
         logger.info(f"  Patches per side: {self.num_patches_per_side}, Total patches: {self.num_patches}")
         
@@ -177,35 +192,78 @@ class VPOGTrainDataset:
                 torch.cuda.manual_seed_all(seed)
             logger.info(f"  Set random seed to {seed} for reproducibility")
         else:
-        
             logger.info(f"  No seed set - results will vary between runs")
+        
+        # Auto-detect split if not provided
+        if split is None:
+            split = self._get_split_for_mode(mode)
+        logger.info(f"  Using split: {split}")
+        
         # Load the web dataset (query images)
+        split_dir = self.dataset_dir / split
+        if not split_dir.exists():
+            raise FileNotFoundError(f"Split directory not found: {split_dir}")
+        
         web_dataset = WebSceneDataset(
-            self.dataset_dir / "train_pbr_web",
+            split_dir,
             depth_scale=depth_scale
         )
-        self.web_dataloader = IterableWebSceneDataset(web_dataset)
+        
+        # Load object index (REQUIRED)
+        object_index_path = split_dir / "object_index.json"
+        if not object_index_path.exists():
+            raise FileNotFoundError(
+                f"\n{'='*80}\n"
+                f"Object index not found: {object_index_path}\n"
+                f"\n"
+                f"The object index is required for object-level iteration.\n"
+                f"Please build it using:\n"
+                f"\n"
+                f"  python training/scripts/build_object_index.py \\\n"
+                f"    --dataset {dataset_name} \\\n"
+                f"    --split {split}\n"
+                f"{'='*80}\n"
+            )
+        
+        object_index = load_object_index(object_index_path)
+        self.web_dataloader = ObjectLevelDataset(web_dataset, object_index)
+        self.size = len(object_index)
+        
+        logger.info(f"  Loaded {self.size} objects from {len(web_dataset)} scenes")
         
         # Load template dataset
-        model_infos = inout.load_json(self.dataset_dir / "models_info.json")
+        if mode == 'train':
+            model_infos = inout.load_json(self.dataset_dir / "models_info.json")
+        else:
+            model_infos_bop = inout.load_json(self.dataset_dir / "models" / "models_info.json")
+            model_infos = [{"obj_id": int(obj_id)} for obj_id in model_infos_bop.keys()]
         template_config['dir'] = f"{template_config['dir']}/{dataset_name}"
         
-        # Create config object with required attributes
-        # TemplateDataset.from_config expects: dir, pose_name, num_templates, scale_factor
-        config_obj = type('Config', (), {
-            'dir': template_config['dir'],
-            'pose_name': template_config.get('pose_name', 'object_poses/OBJECT_ID.npy'),
-            'num_templates': template_config.get('num_templates', 162),
-            'scale_factor': template_config.get('scale_factor', 10.0),
-            'level_templates': template_config.get('level_templates', 1),
-            'pose_distribution': template_config.get('pose_distribution', 'all'),
-        })()
+        # # Create config object with required attributes
+        # # TemplateDataset.from_config expects: dir, pose_name, num_templates, scale_factor
+        # config_obj = type('Config', (), {
+        #     'dir': template_config['dir'],
+        #     'pose_name': template_config.get('pose_name', 'object_poses/OBJECT_ID.npy'),
+        #     'num_templates': template_config.get('num_templates', 162),
+        #     'scale_factor': template_config.get('scale_factor', 10.0),
+        #     'level_templates': template_config.get('level_templates', 1),
+        #     'pose_distribution': template_config.get('pose_distribution', 'all'),
+        # })()
         
         self.template_dataset = TemplateDataset.from_config(
-            model_infos, config_obj
+            model_infos, template_config
         )
+
+        self.cad_scale_factor = template_config.get('scale_factor', 10.0)
         
         logger.info(f"  Loaded {len(self.template_dataset)} object templates")
+        
+        # Auto-set d_ref_random_ratio based on mode if not provided
+        if d_ref_random_ratio is None:
+            # For validation, always use nearest (deterministic)
+            # For training, use nearest by default (can be overridden)
+            d_ref_random_ratio = 0.0
+        logger.info(f"  d_ref_random_ratio: {d_ref_random_ratio} (0.0=nearest, 1.0=random)")
         
         # Initialize template selector with seed for reproducibility
         self.template_selector = TemplateSelector(
@@ -223,23 +281,47 @@ class VPOGTrainDataset:
         
         # Initialize flow computer
         flow_config = flow_config or {}
-        self.flow_computer = FlowComputer(
-            patch_size=patch_size,
-            compute_visibility=flow_config.get('compute_visibility', True),
-            compute_patch_visibility=flow_config.get('compute_patch_visibility', True),
-            visibility_threshold=flow_config.get('visibility_threshold', 0.1),
-        )
+        # self.flow_computer = FlowComputer(
+        #     patch_size=patch_size,
+        #     compute_visibility=flow_config.get('compute_visibility', True),
+        #     compute_patch_visibility=flow_config.get('compute_patch_visibility', True),
+        #     visibility_threshold=flow_config.get('visibility_threshold', 0.1),
+        # )
         
-        logger.info(f"  Flow computation: visibility={self.flow_computer.compute_visibility}, "
-                   f"patch_visibility={self.flow_computer.compute_patch_visibility}")
+        # logger.info(f"  Flow computation: visibility={self.flow_computer.compute_visibility}, "
+        #            f"patch_visibility={self.flow_computer.compute_patch_visibility}")
         
         # Setup transforms
         self._setup_transforms()
 
         self.debug_mode = True if "debug" in kwargs and kwargs["debug"] else False
+        self.vis_dir =  kwargs.get("vis_dir", "tmp/vpog_dataset_flow_vis")
+
+
+    def __len__(self) -> int:
+        """Return number of samples in the dataset."""
+        return self.size
+    
+    def _get_split_for_mode(self, mode: str) -> str:
+        """Determine the appropriate split directory for the given mode."""
+        if mode == 'train':
+            # Try training splits in order of preference
+            possible_splits = ['train_pbr_web', 'train_pbr', 'train']
+        else:  # mode == 'val'
+            # Try validation/test splits in order of preference
+            possible_splits = ['test_all', 'test', 'val']
+        
+        for split in possible_splits:
+            if (self.dataset_dir / split).exists():
+                return split
+        
+        # Fallback
+        fallback = 'train_pbr_web' if mode == 'train' else 'test'
+        logger.warning(f"Could not find standard split for mode={mode}, using: {fallback}")
+        return fallback
     
     def _setup_transforms(self):
-        """Setup data augmentation transforms"""
+        """Setup data augmentation transforms based on mode"""
         transforms = self.transforms
         
         # Normalize transform
@@ -260,15 +342,37 @@ class VPOGTrainDataset:
             from src.utils.crop import CropResizePad
             self.crop_transform = CropResizePad(target_size=self.image_size)
         
-        # RGB augmentation
-        self.rgb_augmentation = transforms.get('rgb_augmentation', False)
-        if self.rgb_augmentation and 'rgb_transform' in transforms:
-            self.rgb_transform = transforms['rgb_transform']
-        else:
+        # RGB augmentation - disabled for validation mode
+        if self.mode == 'val':
+            self.rgb_augmentation = False
             self.rgb_transform = None
-        
-        # Inplane augmentation (important for VPOG)
-        self.inplane_augmentation = transforms.get('inplane_augmentation', False)
+            self.inplane_augmentation = False
+        else:
+            # Training mode - use transforms from config
+            self.rgb_augmentation = transforms.get('rgb_augmentation', False)
+            if self.rgb_augmentation and 'rgb_transform' in transforms:
+                rgb_transform_config = transforms['rgb_transform']
+                
+                # Check if it's a Hydra config (DictConfig/ListConfig) that needs instantiation
+                from omegaconf import DictConfig, ListConfig
+                if isinstance(rgb_transform_config, (DictConfig, ListConfig)):
+                    # Instantiate from config with full conversion to resolve nested configs
+                    from hydra.utils import instantiate
+                    self.rgb_transform = instantiate(rgb_transform_config, _convert_="all")
+                else:
+                    # Already instantiated
+                    self.rgb_transform = rgb_transform_config
+                
+                # Verify it's callable
+                if not callable(self.rgb_transform):
+                    logger.warning(f"rgb_transform is not callable: {type(self.rgb_transform)}")
+                    self.rgb_transform = None
+                    self.rgb_augmentation = False
+            else:
+                self.rgb_transform = None
+            
+            # Inplane augmentation (important for VPOG)
+            self.inplane_augmentation = transforms.get('inplane_augmentation', False)
     
     def process_query(
         self,
@@ -277,15 +381,18 @@ class VPOGTrainDataset:
     ) -> tc.PandasTensorCollection:
         """
         Process query images from the batch.
-        Similar to GigaPose's process_real but adapted for VPOG.
+        
+        With object-level iteration, each scene in the batch contains exactly 1 object.
+        No need for random sampling - all objects are already selected by DataLoader.
         
         Args:
-            batch: Batch of scene observations
+            batch: Batch of scene observations (each with 1 object)
             min_box_size: Minimum bounding box size
         
         Returns:
             Processed query data
         """
+        batch_size = batch["rgb"].shape[0]
         # Get ground truth data
         rgb = batch["rgb"] / 255.0
         depth = batch["depth"].squeeze(1) if "depth" in batch else None
@@ -295,12 +402,11 @@ class VPOGTrainDataset:
         # Make bounding boxes square
         bboxes = BoundingBox(detections.bboxes, "xywh")
         
-        # Sample up to batch_size objects
-        idx_selected = np.random.choice(
-            np.arange(len(detections.bboxes)),
-            min(self.batch_size, len(detections.bboxes)),
-            replace=False,
-        )
+        # With object-level iteration, each scene has exactly 1 object
+        # Select all objects in the batch (no random sampling needed)
+        num_objects = len(detections.bboxes)
+        idx_selected = np.arange(num_objects)
+
         
         bboxes = bboxes.reset(idx_selected)
         batch_im_id = detections[idx_selected].infos.batch_im_id
@@ -373,7 +479,7 @@ class VPOGTrainDataset:
         Returns:
             Tuple of (template_data, selection_info)
         """
-        batch_size = len(query_data)
+        # batch_size = len(query_data)
         
         # Storage for template data
         template_rgbas = []
@@ -408,9 +514,9 @@ class VPOGTrainDataset:
             nearest_info = template_finder.search_nearest_template(query_pose[:3, :3])
             nearest_template_idx = nearest_info['view_id']
             
-            # DEBUG: Log for verification
-            if label == '733' or (len(template_indices_list) == 0 and logger.level <= 20):
-                logger.info(f"  Object {label}: Nearest OOP template t* = {nearest_template_idx}")
+            # # DEBUG: Log for verification
+            # if label == '733' or (len(template_indices_list) == 0 and logger.level <= 20):
+            #     logger.info(f"  Object {label}: Nearest OOP template t* = {nearest_template_idx}")
             
             # STEP 2: Find S_p-1 additional templates that are closest to t* in full SO(3)
             # These provide small perturbations around t* to reveal more pixels
@@ -660,7 +766,7 @@ class VPOGTrainDataset:
         points_world = (T_q2w @ points_homo.T).T[:, :3]  # [N, 3] in BOP scale (mm)
         
         # Step 2: Scale world points by 10 (BOP model → Normalized × 10 model)
-        points_world_scaled = points_world * 10.0
+        points_world_scaled = points_world * self.cad_scale_factor
         
         # Step 3: Transform from scaled world to template camera frame
         # template_cam = TWO_t @ world_scaled
@@ -709,54 +815,17 @@ class VPOGTrainDataset:
         
         return u, v, z, valid
     
-    def _project_pcd_helper(self, pcd_world, pose, K, H, W):
-        """
-        Helper for visualization - project world point cloud to depth image.
-        
-        Args:
-            pcd_world: [N, 3] point cloud in world frame
-            pose: [4, 4] TWO matrix (world-to-camera)
-            K: [3, 3] camera intrinsics
-            H, W: output image size
-        
-        Returns:
-            [H, W] depth image with depth values
-        """
-        pcd_homo = np.concatenate([pcd_world, np.ones((len(pcd_world), 1))], axis=1)
-        pcd_cam = (pose @ pcd_homo.T).T
-        x, y, z = pcd_cam[:, 0], pcd_cam[:, 1], pcd_cam[:, 2]
-        
-        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-        u = (x / z) * fx + cx
-        v = (y / z) * fy + cy
-        
-        depth_img = np.zeros((H, W))
-        valid = (z > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        for u_i, v_i, z_i in zip(u[valid].astype(int), v[valid].astype(int), z[valid]):
-            if depth_img[v_i, u_i] == 0 or z_i < depth_img[v_i, u_i]:
-                depth_img[v_i, u_i] = z_i
-        return depth_img
-    
-    def _visualize_correspondences(
+    def compute_flow_labels_for_train(
         self,
-        query_data,
-        template_data,
-        points_q_cam,
-        correspondences,
-        q_pose,
-        t_pose,
-        q_K_orig,
-        t_K_orig,
-        q_depth_orig,
-        t_depth_orig,
-        q_mask_orig,
-        batch_idx,
-        template_idx,
-    ):
+        query_data: tc.PandasTensorCollection,
+        template_data: tc.PandasTensorCollection,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Visualize correspondences between query and template (CORRECT LOGIC ONLY).
-        
-        Uses mesh projection to validate transformation - this is the GOOD method.
+        Compute training labels between query and templates using CROPPED 224x224 depth/K.
+
+        Outputs:
+            - flows        : [B, S, H_p, W_p, 2]  (coarse query→template flow, patch centers)
+            - visibility   : [B, S, H_p, W_p]     (patch is visible in template)
         """
         import matplotlib.pyplot as plt
         
@@ -791,9 +860,9 @@ class VPOGTrainDataset:
                 pcd_world, q_pose_np, q_K_orig.cpu().numpy(), H_orig, W_orig
             )
             
-            # Project to template with 10x scaling (GOOD METHOD)
+            # Project to template with cad_scale_factorx scaling 
             template_depth_render = self._project_pcd_helper(
-                pcd_world * 10, t_pose_np, t_K_orig.cpu().numpy(), H_t_orig, W_t_orig
+                pcd_world * self.cad_scale_factor, t_pose_np, t_K_orig.cpu().numpy(), H_t_orig, W_t_orig
             )
             
         except Exception as e:
@@ -872,7 +941,8 @@ class VPOGTrainDataset:
         plt.tight_layout()
         
         # Save
-        save_path = Path(f"tmp/vpog_dataset_test/correspondences_b{batch_idx}_s{template_idx}.png")
+        Path(self.vis_dir).mkdir(parents=True, exist_ok=True)
+        save_path = Path(f"{self.vis_dir}/correspondences_b{batch_idx}_s{template_idx}.png")
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
@@ -1118,14 +1188,12 @@ class VPOGTrainDataset:
             fontsize=13, fontweight='bold'
         )
         
-        save_dir = Path("tmp/vpog_dataset_test")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"dense_flow_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
+        Path(self.vis_dir).mkdir(parents=True, exist_ok=True)
+        save_path = f"{self.vis_dir}/dense_flow_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         
         logger.info(f"  [DENSE VIZ] ✓ Saved dense flow visualization to {save_path}")
-
     
     def _visualize_train_correspondences(
         self,
@@ -1193,7 +1261,7 @@ class VPOGTrainDataset:
             
             # Project to template with 10x scaling (GOOD METHOD)
             template_depth_render = self._project_pcd_helper(
-                pcd_world * 10, t_pose_np, t_K.cpu().numpy(), H, W
+                pcd_world * self.cad_scale_factor, t_pose_np, t_K.cpu().numpy(), H, W
             )
             
         except Exception as e:
@@ -1333,8 +1401,7 @@ class VPOGTrainDataset:
         
         # Save with unique identifier (object label + batch + template indices)
         # Get actual template index from selection_info if available
-        save_path = Path(f"tmp/vpog_dataset_test/train_corr_obj{obj_label}_b{batch_idx}_t{template_idx}.png")
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path = f"{self.vis_dir}/train_corr_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         
@@ -1592,314 +1659,12 @@ class VPOGTrainDataset:
         
         # Save with unique identifier
         obj_label = query_data.infos.label[batch_idx]
-        save_path = Path(f"tmp/vpog_dataset_test/train_patches_obj{obj_label}_b{batch_idx}_t{template_idx}.png")
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        Path(self.vis_dir).mkdir(parents=True, exist_ok=True)
+        save_path = f"{self.vis_dir}/train_patches_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
+        plt.close()        
         logger.info(f"  [TRAIN VIZ] ✓ Saved patch visualization to {save_path}")
     
-    # def compute_flow_labels_for_train(
-    #     self,
-    #     query_data: tc.PandasTensorCollection,
-    #     template_data: tc.PandasTensorCollection,
-    # ) -> Dict[str, torch.Tensor]:
-    #     """
-    #     Compute flow labels between query and templates.
-    #     Uses CROPPED/CENTERED 224x224 depth/K for training (matches model input resolution).
-        
-    #     This is the TRAINING version - operates on cropped data.
-    #     """
-    #     device = query_data.K.device
-    #     B = len(query_data)
-    #     S = self.num_templates
-    #     H, W = self.image_size, self.image_size  # 224x224
-    #     ps = self.patch_size
-        
-    #     with torch.inference_mode():
-    #         # Initialize outputs [B, S, H_p, W_p, ...]
-    #         H_p = self.num_patches_per_side
-    #         flows = torch.zeros(B, S, H_p, H_p, 2, device=device)
-    #         patch_vis = torch.zeros(B, S, H_p, H_p, dtype=torch.bool, device=device)
-            
-    #         for b in range(B):
-    #             # Use CROPPED centered data (224x224)
-    #             q_K = query_data.K[b]  # [3, 3] - cropped K
-    #             q_depth = query_data.depth[b]  # [224, 224] - cropped depth
-    #             q_mask = query_data.mask[b]  # [224, 224] - cropped mask
-    #             q_pose = query_data.pose[b]  # [4, 4]
-                
-    #             # Unproject query depth to 3D point cloud in query camera frame
-    #             points_q_cam = self.unproject_query_depth(
-    #                 depth=q_depth,
-    #                 K=q_K,
-    #                 mask=q_mask,
-    #             )  # [224, 224, 3] in query camera frame (BOP scale, mm)
-                
-    #             # Valid query pixels
-    #             valid_q = (q_depth > 0) & (q_mask > 0.5)
-                
-    #             for s in range(S):
-    #                 # Template data (CROPPED)
-    #                 t_K = template_data.K[b, s]  # [3, 3] - cropped K
-    #                 t_pose = template_data.pose[b, s]  # [4, 4]
-    #                 t_depth = template_data.depth[b, s]  # [224, 224] - cropped depth
-                    
-    #                 # Transform query point cloud to template camera frame
-    #                 points_t_cam = self.transform_query_to_template_space(
-    #                     query_points_cam=points_q_cam,
-    #                     query_pose=q_pose,
-    #                     template_pose=t_pose,
-    #                 )  # [224, 224, 3] in template camera frame (template scale)
-                    
-    #                 # Project to template image
-    #                 u_t, v_t, z_t, valid_proj = self.project_to_template_image(
-    #                     points_template_cam=points_t_cam,
-    #                     K_template=t_K,
-    #                     H=H,
-    #                     W=W,
-    #                 )
-                    
-    #                 # Combine with query validity
-    #                 valid_proj = valid_proj & valid_q
-                    
-    #                 # Check occlusion
-    #                 u_int = u_t.long().clamp(0, W-1)
-    #                 v_int = v_t.long().clamp(0, H-1)
-    #                 z_template_gt = t_depth[v_int, u_int]
-    #                 not_occluded = (z_t <= z_template_gt + self.flow_computer.depth_tolerance)
-
-    #                 # Final visibility
-    #                 visible = valid_proj & not_occluded
-                    
-    #                 num_visible = visible.sum().item()
-    #                 logger.info(f"  [TRAIN] Sample {b}, Template {s}: {num_visible} pixels visible")
-                    
-    #                 # ========== COMPUTE VISIBILITY MAPS ==========
-    #                 # Valid masks (only consider pixels inside object masks)
-    #                 query_valid_mask = (q_depth > 0) & (q_mask > 0.5)  # Query object pixels
-    #                 template_valid_mask = (t_depth > 0)  # Template object pixels
-                    
-    #                 # 1. Query Seen Map: which query pixels (within mask) are visible in template
-    #                 #    Only meaningful for query pixels within the query mask
-    #                 query_seen_map = torch.zeros(H, W, dtype=torch.bool, device=device)
-    #                 query_seen_map[query_valid_mask] = visible[query_valid_mask]  # True if query pixel is seen in template
-                    
-    #                 # 2. Template Seen Map: which template pixels (within mask) have query projections
-    #                 #    Build by marking all template pixels where query projects
-    #                 template_seen_map = torch.zeros(H, W, dtype=torch.bool, device=device)  # [H, W]
-    #                 if visible.any():
-    #                     # Mark template pixels where visible query pixels project
-    #                     visible_u = u_int[visible]
-    #                     visible_v = v_int[visible]
-    #                     template_seen_map[visible_v, visible_u] = True
-                    
-    #                 # Template pixels NOT seen: in template mask but not in template_seen_map
-    #                 template_not_seen_map = template_valid_mask & (~template_seen_map)
-                    
-    #                 # Query pixels NOT seen: in query mask but not visible in template
-    #                 query_not_seen_map = query_valid_mask & (~query_seen_map)
-                    
-    #                 # Log statistics (only count within masks)
-    #                 num_query_pixels = query_valid_mask.sum().item()
-    #                 num_query_seen = query_seen_map.sum().item()
-    #                 num_query_not_seen = query_not_seen_map.sum().item()
-                    
-    #                 num_template_pixels = template_valid_mask.sum().item()
-    #                 num_template_seen = template_seen_map.sum().item()
-    #                 num_template_not_seen = template_not_seen_map.sum().item()
-                    
-    #                 logger.info(f"  [TRAIN] Visibility statistics:")
-    #                 logger.info(f"    Query: {num_query_seen}/{num_query_pixels} pixels visible in template ({num_query_not_seen} occluded)")
-    #                 logger.info(f"    Template: {num_template_seen}/{num_template_pixels} pixels have query projection ({num_template_not_seen} NOT in query)")
-                    
-    #                 # ========== COMPUTE PATCH-LEVEL CORRESPONDENCES ==========
-    #                 H_p = self.num_patches_per_side  # 14 patches per side for 224x224 with patch_size=16
-    #                 ps = self.patch_size  # 16
-                    
-    #                 # For each query patch, compute correspondence to template patch
-    #                 # Patch indices: i_p, j_p in [0, H_p) for patch grid
-    #                 patch_i, patch_j = torch.meshgrid(
-    #                     torch.arange(H_p, device=device),
-    #                     torch.arange(H_p, device=device),
-    #                     indexing='ij'
-    #                 )  # [H_p, H_p]
-                    
-    #                 # Patch centers in pixel coordinates
-    #                 patch_center_y = patch_i * ps + ps // 2  # [H_p, H_p]
-    #                 patch_center_x = patch_j * ps + ps // 2  # [H_p, H_p]
-                    
-    #                 # For each patch, determine if CENTER pixel belongs to object mask
-    #                 patch_has_object = torch.zeros(H_p, H_p, dtype=torch.bool, device=device)
-    #                 patch_is_visible = torch.zeros(H_p, H_p, dtype=torch.bool, device=device)
-    #                 patch_flow_x = torch.zeros(H_p, H_p, device=device)
-    #                 patch_flow_y = torch.zeros(H_p, H_p, device=device)
-    #                 patch_buddy_i = torch.zeros(H_p, H_p, dtype=torch.long, device=device)
-    #                 patch_buddy_j = torch.zeros(H_p, H_p, dtype=torch.long, device=device)
-    #                 # Store center of mass projections for visualization
-    #                 patch_center_mass_u = torch.zeros(H_p, H_p, device=device)
-    #                 patch_center_mass_v = torch.zeros(H_p, H_p, device=device)
-                    
-    #                 # Process all patches at once (vectorized)
-    #                 for i_p in range(H_p):
-    #                     for j_p in range(H_p):
-    #                         # Pixel range for this patch
-    #                         y_start, y_end = i_p * ps, (i_p + 1) * ps
-    #                         x_start, x_end = j_p * ps, (j_p + 1) * ps
-                            
-    #                         # Check if CENTER pixel of patch belongs to object mask
-    #                         center_y = i_p * ps + ps // 2
-    #                         center_x = j_p * ps + ps // 2
-                            
-    #                         # Only process patch if its CENTER belongs to object mask
-    #                         if query_valid_mask[center_y, center_x]:
-    #                             patch_has_object[i_p, j_p] = True
-                                
-    #                             # Extract patch regions for visibility check
-    #                             patch_visible = query_seen_map[y_start:y_end, x_start:x_end]
-                                
-    #                             # Check if any pixels are visible in template
-    #                             if patch_visible.any():
-    #                                 patch_is_visible[i_p, j_p] = True
-                                    
-    #                                 # Get template projections for visible pixels in this patch
-    #                                 patch_u = u_int[y_start:y_end, x_start:x_end]  # [ps, ps]
-    #                                 patch_v = v_int[y_start:y_end, x_start:x_end]  # [ps, ps]
-                                    
-    #                                 # Only consider visible pixels
-    #                                 visible_u = patch_u[patch_visible].float()
-    #                                 visible_v = patch_v[patch_visible].float()
-                                    
-    #                                 # Compute center of mass of template projections
-    #                                 center_mass_u = visible_u.mean()
-    #                                 center_mass_v = visible_v.mean()
-                                    
-    #                                 # Store for visualization
-    #                                 patch_center_mass_u[i_p, j_p] = center_mass_u
-    #                                 patch_center_mass_v[i_p, j_p] = center_mass_v
-                                    
-    #                                 # Find template patch whose center is closest to center of mass
-    #                                 # Template patch centers
-    #                                 template_patch_centers_x = torch.arange(H_p, device=device) * ps + ps // 2  # [H_p]
-    #                                 template_patch_centers_y = torch.arange(H_p, device=device) * ps + ps // 2  # [H_p]
-                                    
-    #                                 # Distance from center of mass to each template patch center
-    #                                 dist_x = template_patch_centers_x - center_mass_u  # [H_p]
-    #                                 dist_y = template_patch_centers_y - center_mass_v  # [H_p]
-                                    
-    #                                 # Grid of distances [H_p, H_p]
-    #                                 dist_grid = dist_x[None, :] ** 2 + dist_y[:, None] ** 2
-                                    
-    #                                 # Find closest template patch
-    #                                 min_idx = dist_grid.argmin()
-    #                                 buddy_i = min_idx // H_p
-    #                                 buddy_j = min_idx % H_p
-                                    
-    #                                 patch_buddy_i[i_p, j_p] = buddy_i
-    #                                 patch_buddy_j[i_p, j_p] = buddy_j
-                                    
-    #                                 # Compute flow: from query patch center to template patch center
-    #                                 query_center_x = j_p * ps + ps // 2
-    #                                 query_center_y = i_p * ps + ps // 2
-    #                                 template_buddy_center_x = buddy_j * ps + ps // 2
-    #                                 template_buddy_center_y = buddy_i * ps + ps // 2
-                                    
-    #                                 # Flow in pixels
-    #                                 flow_x_px = template_buddy_center_x - query_center_x
-    #                                 flow_y_px = template_buddy_center_y - query_center_y
-                                    
-    #                                 # Normalized by patch size
-    #                                 patch_flow_x[i_p, j_p] = flow_x_px / ps
-    #                                 patch_flow_y[i_p, j_p] = flow_y_px / ps
-                    
-    #                 num_patches_with_object = patch_has_object.sum().item()
-    #                 num_patches_visible = patch_is_visible.sum().item()
-                    
-    #                 logger.info(f"  [TRAIN] Patch-level statistics:")
-    #                 logger.info(f"    Patches with object: {num_patches_with_object}/{H_p*H_p}")
-    #                 logger.info(f"    Patches visible in template: {num_patches_visible}/{num_patches_with_object}")
-    #                 if num_patches_visible > 0:
-    #                     logger.info(f"    Flow range: x=[{patch_flow_x[patch_is_visible].min():.2f}, {patch_flow_x[patch_is_visible].max():.2f}] patches")
-    #                     logger.info(f"                y=[{patch_flow_y[patch_is_visible].min():.2f}, {patch_flow_y[patch_is_visible].max():.2f}] patches")
-                    
-    #                 # ========== VISUALIZATION (first batch, all templates) ==========
-    #                 if self.debug_mode:
-    #                     # Extract correspondences
-    #                     valid_corr_mask = visible.flatten()
-                        
-    #                     if valid_corr_mask.any():
-    #                         # Query pixel grid
-    #                         query_y, query_x = torch.meshgrid(
-    #                             torch.arange(H, device=device),
-    #                             torch.arange(W, device=device),
-    #                             indexing='ij'
-    #                         )
-                            
-    #                         # Extract visible correspondences
-    #                         q_x_corr = query_x.flatten()[valid_corr_mask]  # [N_corr]
-    #                         q_y_corr = query_y.flatten()[valid_corr_mask]  # [N_corr]
-    #                         q_z_corr = q_depth.flatten()[valid_corr_mask]  # [N_corr] in mm (BOP scale)
-                            
-    #                         t_u_corr = u_int.flatten()[valid_corr_mask]  # [N_corr]
-    #                         t_v_corr = v_int.flatten()[valid_corr_mask]  # [N_corr]
-    #                         t_z_corr = z_t.flatten()[valid_corr_mask]  # [N_corr] in template units
-                            
-    #                         # Correspondence summary
-    #                         num_corr = len(q_x_corr)
-    #                         logger.info(f"  [TRAIN] ✓ Extracted {num_corr} correspondences")
-    #                         logger.info(f"    Query depths: [{q_z_corr.min():.1f}, {q_z_corr.max():.1f}] mm")
-    #                         logger.info(f"    Template depths: [{t_z_corr.min():.1f}, {t_z_corr.max():.1f}] template units")
-                            
-    #                         correspondences = {
-    #                             'query_x': q_x_corr,
-    #                             'query_y': q_y_corr,
-    #                             'query_z': q_z_corr,
-    #                             'template_u': t_u_corr,
-    #                             'template_v': t_v_corr,
-    #                             'template_z': t_z_corr,
-    #                             'count': num_corr,
-    #                         }
-    #                     else:
-    #                         logger.warning(f"  [TRAIN] ✗ No valid correspondences found!")
-    #                         correspondences = None
-                        
-    #                     # Visualize with mesh validation AND visibility maps AND patch correspondences
-    #                     self._visualize_train_correspondences(
-    #                         query_data=query_data,
-    #                         template_data=template_data,
-    #                         points_q_cam=points_q_cam,
-    #                         correspondences=correspondences,
-    #                         q_pose=q_pose,
-    #                         t_pose=t_pose,
-    #                         q_K=q_K,
-    #                         t_K=t_K,
-    #                         q_depth=q_depth,
-    #                         t_depth=t_depth,
-    #                         q_mask=q_mask,
-    #                         query_seen_map=query_seen_map,
-    #                         template_seen_map=template_seen_map,
-    #                         template_not_seen_map=template_not_seen_map,
-    #                         patch_has_object=patch_has_object,
-    #                         patch_is_visible=patch_is_visible,
-    #                         patch_flow_x=patch_flow_x,
-    #                         patch_flow_y=patch_flow_y,
-    #                         patch_buddy_i=patch_buddy_i,
-    #                         patch_buddy_j=patch_buddy_j,
-    #                         patch_center_mass_u=patch_center_mass_u,
-    #                         patch_center_mass_v=patch_center_mass_v,
-    #                         batch_idx=b,
-    #                         template_idx=s,
-    #                     )
-                    
-    #                 # For now: simple patch visibility
-    #                 if num_visible > 0:
-    #                     patch_vis[b, s, :, :] = True
-        
-    #     return {
-    #         'flows': flows,
-    #         'visibility': patch_vis,
-    #         'patch_visibility': patch_vis,
-    #     }
     def compute_flow_labels_for_train(
         self,
         query_data: tc.PandasTensorCollection,
@@ -1927,7 +1692,7 @@ class VPOGTrainDataset:
         
         with torch.inference_mode():
             # Coarse flows & visibility
-            flows = torch.zeros(B, S, H_p, H_p, 2, device=device)
+            coarse_flows = torch.zeros(B, S, H_p, H_p, 2, device=device)
             patch_vis = torch.zeros(B, S, H_p, H_p, dtype=torch.bool, device=device)
             patch_cls = torch.full(
                 (B, S, H_p, H_p), unseen_class,
@@ -1936,7 +1701,7 @@ class VPOGTrainDataset:
             
             # Dense (per sub-pixel) flow & weights
             dense_flow = torch.zeros(B, S, H_p, H_p, ps, ps, 2, device=device)
-            dense_weight = torch.zeros(B, S, H_p, H_p, ps, ps, device=device)
+            dense_visibility = torch.zeros(B, S, H_p, H_p, ps, ps, device=device)
             
             # Precompute query pixel grid and patch indices for 224x224
             query_y, query_x = torch.meshgrid(
@@ -1970,8 +1735,16 @@ class VPOGTrainDataset:
                 q_mask = query_data.mask[b]   # [224, 224]
                 q_pose = query_data.pose[b]   # [4, 4]
                 
+                # # DIAGNOSTIC: Check query data
+                # logger.info(f"[DIAGNOSTIC] Sample {b}:")
+                # logger.info(f"  q_depth range: [{q_depth.min():.2f}, {q_depth.max():.2f}], shape: {q_depth.shape}")
+                # logger.info(f"  q_mask range: [{q_mask.min():.2f}, {q_mask.max():.2f}], shape: {q_mask.shape}")
+                # logger.info(f"  q_depth > 0: {(q_depth > 0).sum()}/{q_depth.numel()} pixels")
+                # logger.info(f"  q_mask > 0.5: {(q_mask > 0.5).sum()}/{q_mask.numel()} pixels")
+                
                 # Query object pixels
                 query_valid_mask = (q_depth > 0) & (q_mask > 0.5)  # [H, W]
+                # logger.info(f"  query_valid_mask: {query_valid_mask.sum()}/{query_valid_mask.numel()} pixels")
                 
                 # Unproject query depth to 3D in query camera frame
                 points_q_cam = self.unproject_query_depth(
@@ -1991,6 +1764,11 @@ class VPOGTrainDataset:
                     # Extract center pixels of each query patch
                     patch_center_depths = q_depth[patch_center_y, patch_center_x]  # [H_p, H_p]
                     patch_center_valid = query_valid_mask[patch_center_y, patch_center_x]  # [H_p, H_p]
+                    
+                    # # DIAGNOSTIC: Check patch center validity
+                    # logger.info(f"  Template {s}:")
+                    # logger.info(f"    patch_center_depths range: [{patch_center_depths.min():.2f}, {patch_center_depths.max():.2f}]")
+                    # logger.info(f"    patch_center_valid: {patch_center_valid.sum()}/{patch_center_valid.numel()} patches")
                     
                     # Unproject patch centers only
                     fx, fy = q_K[0, 0], q_K[1, 1]
@@ -2030,10 +1808,18 @@ class VPOGTrainDataset:
                     u_int_centers = u_t_centers.long().clamp(0, W - 1)
                     v_int_centers = v_t_centers.long().clamp(0, H - 1)
                     z_template_gt_centers = t_depth[v_int_centers, u_int_centers]
-                    not_occluded_centers = (z_t_centers <= z_template_gt_centers + self.flow_computer.depth_tolerance)
+                    not_occluded_centers = (z_t_centers <= z_template_gt_centers + self.depth_tolerance)
                     
                     # Final visibility for patch centers
                     visible_centers = valid_proj_centers & not_occluded_centers  # [H_p, H_p]
+                    
+                    # Count visible pixels for logging
+                    num_visible_patches = int(visible_centers.sum().item())
+                    
+                    # # DIAGNOSTIC: Check visibility pipeline
+                    # logger.info(f"    valid_proj_centers: {valid_proj_centers.sum()}/{valid_proj_centers.numel()} patches")
+                    # logger.info(f"    not_occluded_centers: {not_occluded_centers.sum()}/{not_occluded_centers.numel()} patches")
+                    # logger.info(f"    visible_centers (final): {num_visible_patches}/{visible_centers.numel()} patches")
                     
                     # For debug/vis: optionally compute full query→template
                     if self.debug_mode:
@@ -2059,14 +1845,14 @@ class VPOGTrainDataset:
                         u_int = u_t.long().clamp(0, W - 1)
                         v_int = v_t.long().clamp(0, H - 1)
                         z_template_gt = t_depth[v_int, u_int]
-                        not_occluded = (z_t <= z_template_gt + self.flow_computer.depth_tolerance)
+                        not_occluded = (z_t <= z_template_gt + self.depth_tolerance)
                         
                         # Final visibility at pixel level
                         visible = valid_proj & not_occluded  # [H, W]
                         num_visible = int(visible.sum().item())
-                        logger.info(f"  [TRAIN] Sample {b}, Template {s}: {num_visible} pixels visible (full)")
+                        # logger.info(f"  [TRAIN] Sample {b}, Template {s}: {num_visible} pixels visible (full)")
                     
-                    if num_visible == 0:
+                    if num_visible_patches == 0:
                         # Nothing visible: keep zeros / unseen_class
                         continue
                     
@@ -2092,11 +1878,11 @@ class VPOGTrainDataset:
                         num_template_seen = int(template_seen_map.sum().item())
                         num_template_not_seen = int(template_not_seen_map.sum().item())
                         
-                        logger.info(f"  [TRAIN] Visibility statistics:")
-                        logger.info(f"    Query: {num_query_seen}/{num_query_pixels} pixels visible in template "
-                                    f"({num_query_not_seen} occluded)")
-                        logger.info(f"    Template: {num_template_seen}/{num_template_pixels} pixels have query projection "
-                                    f"({num_template_not_seen} NOT in query)")
+                        # logger.info(f"  [TRAIN] Visibility statistics:")
+                        # logger.info(f"    Query: {num_query_seen}/{num_query_pixels} pixels visible in template "
+                        #             f"({num_query_not_seen} occluded)")
+                        # logger.info(f"    Template: {num_template_seen}/{num_template_pixels} pixels have query projection "
+                        #             f"({num_template_not_seen} NOT in query)")
                     
                     # ========== PATCH-LEVEL: which patches have object & are visible ==========
                     # 1) patch_has_object: CENTER pixel in object mask
@@ -2107,9 +1893,9 @@ class VPOGTrainDataset:
                     
                     num_patches_with_object = int(patch_has_object.sum().item())
                     num_patches_visible = int(patch_is_visible.sum().item())
-                    logger.info(f"  [TRAIN] Patch-level statistics:")
-                    logger.info(f"    Patches with object center: {num_patches_with_object}/{H_p*H_p}")
-                    logger.info(f"    Patches visible in template: {num_patches_visible}/{num_patches_with_object or 1}")
+                    # logger.info(f"    Patch-level statistics:")
+                    # logger.info(f"      Patches with object center: {num_patches_with_object}/{H_p*H_p}")
+                    # logger.info(f"      Patches visible in template: {num_patches_visible}/{num_patches_with_object or 1}")
                     
                     if num_patches_visible == 0:
                         # No visible patches: mark background / unseen
@@ -2156,8 +1942,8 @@ class VPOGTrainDataset:
                     # Store coarse flows only where patch_has_object
                     valid_patch = patch_has_object  # [H_p, H_p] bool
 
-                    flows[b, s, :, :, 0][valid_patch] = flow_x_norm[valid_patch]
-                    flows[b, s, :, :, 1][valid_patch] = flow_y_norm[valid_patch]
+                    coarse_flows[b, s, :, :, 0][valid_patch] = flow_x_norm[valid_patch]
+                    coarse_flows[b, s, :, :, 1][valid_patch] = flow_y_norm[valid_patch]
                     
                     # Patch visibility mask
                     patch_vis[b, s] = patch_is_visible
@@ -2214,7 +2000,7 @@ class VPOGTrainDataset:
                     q_u_int = q_u.long().clamp(0, W - 1)
                     q_v_int = q_v.long().clamp(0, H - 1)
                     q_depth_at_proj = q_depth[q_v_int, q_u_int]
-                    not_occluded = (q_Z <= q_depth_at_proj + self.flow_computer.depth_tolerance) | (q_depth_at_proj == 0)
+                    not_occluded = (q_Z <= q_depth_at_proj + self.depth_tolerance) | (q_depth_at_proj == 0)
                     
                     # Final visibility: valid projection AND not occluded AND lands on query mask
                     visible_t2q = valid_proj & not_occluded & query_valid_mask[q_v_int, q_u_int]
@@ -2228,7 +2014,7 @@ class VPOGTrainDataset:
                     # For each query patch [i_q, j_q], we want flow from its buddy template patch [i_t, j_t]
                     # Create mapping using advanced indexing
                     dense_flow_output = torch.zeros(H_p, H_p, ps, ps, 2, device=device)
-                    dense_weight_output = torch.zeros(H_p, H_p, ps, ps, device=device)
+                    dense_visibility_output = torch.zeros(H_p, H_p, ps, ps, device=device)
                     
                     # Get all query patch centers [H_p, H_p, 2]
                     q_patch_centers_j = (torch.arange(H_p, device=device) * ps + ps // 2).view(1, H_p).expand(H_p, H_p)
@@ -2237,7 +2023,7 @@ class VPOGTrainDataset:
                     # For visible query patches, extract buddy template patch data
                     # Use buddy_i, buddy_j to index into template patches
                     # This is done via advanced indexing (vectorized)
-                    dense_weight_output = visible_patches[buddy_i, buddy_j]  # [H_p, H_p, ps, ps]
+                    dense_visibility_output = visible_patches[buddy_i, buddy_j]  # [H_p, H_p, ps, ps]
                     
                     # Compute flow for all pixels
                     # Get query projections for buddy template patches
@@ -2258,53 +2044,62 @@ class VPOGTrainDataset:
                     # Only keep for query patches with object
                     # Apply mask to weight only (flow values don't matter where weight=0)
                     valid_patch_mask = patch_has_object.unsqueeze(-1).unsqueeze(-1)  # [H_p, H_p, 1, 1]
-                    dense_weight_output = dense_weight_output * valid_patch_mask.float()
+                    dense_visibility_output = dense_visibility_output * valid_patch_mask.float()
                     
                     dense_flow[b, s] = dense_flow_output
-                    dense_weight[b, s] = dense_weight_output
+                    dense_visibility[b, s] = dense_visibility_output
                     
                     num_t2q_correspondences = int(visible_t2q.sum().item())
-                    logger.info(f"  [TRAIN] Template→Query: {num_t2q_correspondences} correspondences")
+                    # logger.info(f"  [TRAIN] Template→Query: {num_t2q_correspondences} correspondences")
                     
                     # ========== DEBUG VISUALIZATION ==========
                     if self.debug_mode:
+                        obj_label = query_data.infos.label[b]
+                        
                         # Full visibility + patch correspondence visualization
-                        self._visualize_train_correspondences(
-                            query_data=query_data,
-                            template_data=template_data,
-                            points_q_cam=points_q_cam,
-                            correspondences=None,
-                            q_pose=q_pose,
-                            t_pose=t_pose,
-                            q_K=q_K,
-                            t_K=t_K,
+                        viz.visualize_train_correspondences(
+                            query_rgb=query_data.centered_rgb[b],
+                            template_rgb=template_data.rgb[b, s],
                             q_depth=q_depth,
                             t_depth=t_depth,
                             q_mask=q_mask,
                             query_seen_map=query_seen_map,
                             template_seen_map=template_seen_map,
                             template_not_seen_map=template_not_seen_map,
+                            q_pose=q_pose,
+                            t_pose=t_pose,
+                            batch_idx=b,
+                            template_idx=s,
+                            obj_label=obj_label,
+                            vis_dir=Path(self.vis_dir),
+                        )
+                        
+                        # Patch correspondence visualization
+                        viz.visualize_patch_correspondences(
+                            query_rgb=query_data.centered_rgb[b],
+                            template_rgb=template_data.rgb[b, s],
                             patch_has_object=patch_has_object,
                             patch_is_visible=patch_is_visible,
                             patch_flow_x=flow_x_norm,
                             patch_flow_y=flow_y_norm,
                             patch_buddy_i=buddy_i,
                             patch_buddy_j=buddy_j,
-                            patch_center_mass_u=u_t_centers,  # Use projected centers
-                            patch_center_mass_v=v_t_centers,
                             batch_idx=b,
                             template_idx=s,
+                            obj_label=obj_label,
+                            patch_size=self.patch_size,
+                            num_patches_per_side=self.num_patches_per_side,
+                            vis_dir=Path(self.vis_dir),
                         )
                         
                         # Visualize dense template→query flow
-                        obj_label = query_data.infos.label[b]
-                        self._visualize_dense_patch_flow(
+                        viz.visualize_dense_patch_flow(
                             query_rgb=query_data.centered_rgb[b],
                             template_rgb=template_data.rgb[b, s],
                             q_mask=q_mask,
                             t_depth=t_depth,
                             flow_grid=dense_flow[b, s],
-                            weight_grid=dense_weight[b, s],
+                            weight_grid=dense_visibility[b, s],
                             patch_has_object=patch_has_object,
                             patch_is_visible=patch_is_visible,
                             patch_buddy_i=buddy_i,
@@ -2312,162 +2107,20 @@ class VPOGTrainDataset:
                             batch_idx=b,
                             template_idx=s,
                             obj_label=obj_label,
+                            patch_size=self.patch_size,
+                            num_patches_per_side=self.num_patches_per_side,
+                            vis_dir=Path(self.vis_dir),
                         )
             
             return {
-                'flows': flows,
-                'visibility': patch_vis,
+                'coarse_flows': coarse_flows,
+                # 'visibility': patch_vis,
                 'patch_visibility': patch_vis,
                 'patch_cls': patch_cls,
                 'dense_flow': dense_flow,
-                'dense_weight': dense_weight,
+                'dense_visibility': dense_visibility,
             }
 
-    def compute_flow_labels(
-        self,
-        query_data: tc.PandasTensorCollection,
-        template_data: tc.PandasTensorCollection,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute flow labels between query and templates.
-        Uses ORIGINAL full-resolution depth/K/mask for accurate visibility.
-        """
-        device = query_data.K.device
-        B = len(query_data)
-        S = self.num_templates
-        H, W = self.image_size, self.image_size
-        ps = self.patch_size
-        
-        with torch.inference_mode():
-            # Initialize outputs [B, S, H_p, W_p, ...]
-            H_p = self.num_patches_per_side
-            flows = torch.zeros(B, S, H_p, H_p, 2, device=device)
-            patch_vis = torch.zeros(B, S, H_p, H_p, dtype=torch.bool, device=device)
-            
-            for b in range(B):
-                # Use ORIGINAL uncropped data
-                q_K_orig = query_data.K_original[b]  # [3, 3]
-                q_depth_orig = query_data.full_depth[b]  # [H_orig, W_orig]
-                q_mask_orig = query_data.mask_original[b]  # [H_orig, W_orig]
-                q_pose = query_data.pose[b]  # [4, 4]
-                
-                H_orig, W_orig = q_depth_orig.shape
-                
-                # Unproject query depth to 3D point cloud in query camera frame
-                points_q_cam = self.unproject_query_depth(
-                    depth=q_depth_orig,
-                    K=q_K_orig,
-                    mask=q_mask_orig,
-                )  # [H_orig, W_orig, 3] in query camera frame (BOP scale, mm)
-                # Valid query pixels
-                valid_q = (q_depth_orig > 0) & (q_mask_orig > 0.5)
-                
-                for s in range(S):
-                    # Template data
-                    t_K_orig = template_data.K_original  # [3, 3]
-                    t_pose = template_data.pose[b, s]  # [4, 4]
-                    t_depth_orig = template_data.depth_original[b, s]  # [H_t, W_t]
-                    H_t_orig, W_t_orig = t_depth_orig.shape
-                    
-                    # Transform query point cloud to template camera frame
-                    points_t_cam = self.transform_query_to_template_space(
-                        query_points_cam=points_q_cam,
-                        query_pose=q_pose,
-                        template_pose=t_pose,
-                    )  # [H_orig, W_orig, 3] in template camera frame (template scale)
-                    
-                    # Project to template image
-                    u_t, v_t, z_t, valid_proj = self.project_to_template_image(
-                        points_template_cam=points_t_cam,
-                        K_template=t_K_orig,
-                        H=H_t_orig,
-                        W=W_t_orig,
-                    )
-                    
-                    # Combine with query validity
-                    valid_proj = valid_proj & valid_q
-                    
-                    # Check occlusion
-                    u_int = u_t.long().clamp(0, W_t_orig-1)
-                    v_int = v_t.long().clamp(0, H_t_orig-1)
-                    z_template_gt = t_depth_orig[v_int, u_int]
-                    not_occluded = (z_t <= z_template_gt + self.flow_computer.depth_tolerance)
-                    
-                    # Final visibility
-                    visible = valid_proj & not_occluded
-                    
-                    num_visible = visible.sum().item()
-                    logger.info(f"  Sample {b}, Template {s}: {num_visible} pixels visible")
-                    
-                    # ========== COMPUTE CORRESPONDENCES (CORE LOGIC) ==========
-                    # For first sample/template, compute and visualize correspondences
-                    if self.debug_mode:
-                        # Extract visible correspondences: query pixel → template pixel
-                        valid_corr_mask = visible.flatten()
-                        
-                        if valid_corr_mask.any():
-                            # Query pixel grid
-                            query_y, query_x = torch.meshgrid(
-                                torch.arange(H_orig, device=device),
-                                torch.arange(W_orig, device=device),
-                                indexing='ij'
-                            )
-                            
-                            # Extract visible correspondences
-                            q_x_corr = query_x.flatten()[valid_corr_mask]  # [N_corr]
-                            q_y_corr = query_y.flatten()[valid_corr_mask]  # [N_corr]
-                            q_z_corr = q_depth_orig.flatten()[valid_corr_mask]  # [N_corr] in mm (BOP scale)
-                            
-                            t_u_corr = u_int.flatten()[valid_corr_mask]  # [N_corr]
-                            t_v_corr = v_int.flatten()[valid_corr_mask]  # [N_corr]
-                            t_z_corr = z_t.flatten()[valid_corr_mask]  # [N_corr] in template units
-                            
-                            # Correspondence summary
-                            num_corr = len(q_x_corr)
-                            logger.info(f"  ✓ Extracted {num_corr} correspondences")
-                            logger.info(f"    Query depths: [{q_z_corr.min():.1f}, {q_z_corr.max():.1f}] mm")
-                            logger.info(f"    Template depths: [{t_z_corr.min():.1f}, {t_z_corr.max():.1f}] template units")
-                            
-                            correspondences = {
-                                'query_x': q_x_corr,
-                                'query_y': q_y_corr,
-                                'query_z': q_z_corr,
-                                'template_u': t_u_corr,
-                                'template_v': t_v_corr,
-                                'template_z': t_z_corr,
-                                'count': num_corr,
-                            }
-                        else:
-                            logger.warning(f"  ✗ No valid correspondences found!")
-                            correspondences = None
-                        
-                        # ========== VISUALIZATION (AFTER LOGIC) ==========
-                        self._visualize_correspondences(
-                            query_data=query_data,
-                            template_data=template_data,
-                            points_q_cam=points_q_cam,
-                            correspondences=correspondences,
-                            q_pose=q_pose,
-                            t_pose=template_data.pose[b, s],
-                            q_K_orig=q_K_orig,
-                            t_K_orig=t_K_orig,
-                            q_depth_orig=q_depth_orig,
-                            t_depth_orig=t_depth_orig,
-                            q_mask_orig=q_mask_orig,
-                            batch_idx=b,
-                            template_idx=s,
-                        )
-
-                    
-                    # For now: simple patch visibility
-                    if num_visible > 0:
-                        patch_vis[b, s, :, :] = True
-        
-        return {
-            'flows': flows,
-            'visibility': patch_vis,
-            'patch_visibility': patch_vis,
-        }
 
     def transform_template_to_query_space(
         self,
@@ -2497,7 +2150,7 @@ class VPOGTrainDataset:
         points_world_scaled = (T_t2w @ points_homo.T).T[:, :3]  # [N, 3]
 
         # Step 2: undo the 10x scale (world_scaled -> BOP world)
-        points_world = points_world_scaled / 10.0
+        points_world = points_world_scaled / self.cad_scale_factor
 
         # Step 3: world -> query_cam
         points_homo_world = torch.cat(
@@ -2529,8 +2182,8 @@ class VPOGTrainDataset:
             VPOGBatch or None if error
         """
         try:
-            # Apply RGB augmentation if enabled
-            if self.rgb_augmentation and self.rgb_transform is not None:
+            # Apply RGB augmentation if enabled and self has rgb_augmentation attribute
+            if hasattr(self, 'rgb_augmentation') and self.rgb_augmentation and self.rgb_transform is not None:
                 batch = [self.rgb_transform(data) for data in batch]
             
             # Convert to tensor collection
@@ -2545,7 +2198,7 @@ class VPOGTrainDataset:
             # Compute flow labels using TRAINING version (cropped 224x224)
             flow_labels = self.compute_flow_labels_for_train(query_data, template_data)
             
-            batch_size = len(query_data)
+            # batch_size = len(query_data)
             
             # Combine query and templates into [B, S+1, ...] format
             # Query is first, then S templates
@@ -2602,12 +2255,12 @@ class VPOGTrainDataset:
                 d_ref=selection_info['d_ref'],
                 template_indices=selection_info['template_indices'],
                 template_types=selection_info['template_types'],
-                flows=flow_labels['flows'],
-                visibility=flow_labels['visibility'],
+                coarse_flows=flow_labels['coarse_flows'],
+                visibility=flow_labels['patch_visibility'],
                 patch_visibility=flow_labels['patch_visibility'],
                 patch_cls=flow_labels['patch_cls'],
                 dense_flow=flow_labels['dense_flow'],
-                dense_weight=flow_labels['dense_weight'],
+                dense_visibility=flow_labels['dense_visibility'],
                 infos=query_data.infos,
                 full_rgb=query_data.full_rgb,          # Original full images
                 centered_rgb=query_data.centered_rgb,  # Center crop WITH background
@@ -2627,7 +2280,7 @@ class VPOGTrainDataset:
 
 if __name__ == "__main__":
     """
-    REAL TEST: Full dataset integration with GSO data
+    REAL TEST: Full dataset integration with GSO, ShapeNet, and YCBV validation
     Tests complete pipeline from WebSceneDataset through VPOGBatch creation
     """
     import sys
@@ -2635,293 +2288,204 @@ if __name__ == "__main__":
     import torch
     from torch.utils.data import DataLoader
     import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Rectangle
     
     # Add project root to path
     project_root = Path(__file__).parent.parent.parent
     sys.path.insert(0, str(project_root))
     
     print("=" * 80)
-    print("REAL TEST: VPOGTrainDataset with GSO Data")
+    print("REAL TEST: VPOGDataset with Multiple Datasets")
     print("=" * 80)
     
     # Setup paths
     SEED = 2  # Fixed seed for reproducible test
-    dataset_dir = project_root / "datasets" / "gso"
-    templates_dir = project_root / "datasets" / "templates" / "gso"
-    save_dir = project_root / "tmp" / "vpog_dataset_test"
+    save_dir = project_root / "tmp" / "vpog_dataset_test_training"
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    if not templates_dir.exists():
-        print(f"\n✗ Templates not found at {templates_dir}")
-        print("Please run: python -m src.scripts.render_gso_templates")
-        sys.exit(1)
+    # Define datasets to test
+    test_configs = [
+        # {
+        #     'name': 'GSO',
+        #     'dataset_name': 'gso',
+        #     'is_train': True,
+        # },
+        {
+            'name': 'ShapeNet',
+            'dataset_name': 'shapenet',
+            'is_train': True,
+        },
+        # {
+        #     'name': 'YCBV-VAL',
+        #     'dataset_name': 'ycbv',
+        #     'is_train': False,  # Validation dataset
+        # },
+    ]
     
-    print(f"✓ Found templates at {templates_dir}")
-    
-    print(f"\n✓ Initializing VPOGTrainDataset...")
-    try:
-        template_config = {
-            'dir': str(project_root / "datasets" / "templates"),
-            'level_templates': 1,
-            'pose_distribution': 'all',
-            'scale_factor': 10.0,
-            'num_templates': 162,
-            'pose_name': 'object_poses/OBJECT_ID.npy',
-        }
+    # Test each dataset
+    for test_config in test_configs:
+        print("\n" + "=" * 80)
+        print(f"Testing: {test_config['name']} ({'TRAIN' if test_config['is_train'] else 'VAL'})")
+        print("=" * 80)
         
-        dataset = VPOGTrainDataset(
-            root_dir=str(project_root / "datasets"),
-            dataset_name='gso',
-            template_config=template_config,
-            num_positive_templates=3,
-            num_negative_templates=2,
-            min_negative_angle_deg=90.0,
-            d_ref_random_ratio=0.0,
-            patch_size=16,
-            image_size=224,
-            flow_config={
-                'compute_visibility': True,
-                'compute_patch_visibility': True,
-                'visibility_threshold': 0.1,
-            },
-            batch_size=2,
-            depth_scale=10.0,
-            seed=SEED,
-            debug=True
-        )
-        print(f"✓ Dataset initialized successfully")
-        print(f"  - TemplateDataset: {len(dataset.template_dataset)} templates")
-        print(f"  - Num templates per query: {dataset.num_templates}")
-    except Exception as e:
-        print(f"✗ Failed to initialize dataset: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # Create dataloader using the web_dataloader from dataset
-    print(f"\n✓ Creating DataLoader...")
-    from src.utils.dataloader import NoneFilteringDataLoader
-    
-    dataloader = NoneFilteringDataLoader(
-        dataset.web_dataloader.datapipeline,
-        batch_size=2,
-        num_workers=0,
-        collate_fn=dataset.collate_fn,
-    )
-    
-    # Test batch loading
-    print(f"\n✓ Loading first batch...")
-    try:
-        batch = next(iter(dataloader))
+        dataset_name = test_config['dataset_name']
+        templates_dir = project_root / "datasets" / "templates" / dataset_name
         
-        if batch is None:
-            print("✗ Batch is None!")
-            sys.exit(1)
+        if not templates_dir.exists():
+            print(f"\n✗ Templates not found at {templates_dir}")
+            print(f"Skipping {test_config['name']}...")
+            continue
         
-        print(f"✓ Batch loaded successfully!")
-        print(f"\nBatch structure:")
-        print(f"  images:           {batch.images.shape} (B, S+1, 3, H, W)")
-        print(f"  masks:            {batch.masks.shape} (B, S+1, H, W)")
-        print(f"  K:                {batch.K.shape} (B, S+1, 3, 3)")
-        print(f"  poses:            {batch.poses.shape} (B, S+1, 4, 4)")
-        print(f"  d_ref:            {batch.d_ref.shape} (B, 3)")
-        print(f"  template_indices: {batch.template_indices.shape} (B, S)")
-        print(f"  template_types:   {batch.template_types.shape} (B, S)")
-        print(f"  flows:            {batch.flows.shape} (B, S, H_p, W_p, 2)")
-        print(f"  visibility:       {batch.visibility.shape} (B, S, H_p, W_p)")
-        print(f"  patch_visibility: {batch.patch_visibility.shape} (B, S, H_p, W_p)")
+        print(f"✓ Found templates at {templates_dir}")
         
-        # Verify data ranges
-        print(f"\nData validation:")
-        print(f"  ✓ Images range: [{batch.images.min():.3f}, {batch.images.max():.3f}]")
-        print(f"  ✓ Masks range: [{batch.masks.min():.3f}, {batch.masks.max():.3f}]")
-        print(f"  ✓ d_ref norm: {torch.norm(batch.d_ref, dim=1).tolist()}")
-        
-        # Count positive vs negative templates
-        num_pos = (batch.template_types == 0).sum(dim=1)
-        num_neg = (batch.template_types == 1).sum(dim=1)
-        print(f"  ✓ Positive templates per sample: {num_pos.tolist()}")
-        print(f"  ✓ Negative templates per sample: {num_neg.tolist()}")
-        
-        # Original full RGB info
-        if batch.full_rgb is not None:
-            print(f"\nOriginal full RGB (before cropping):")
-            print(f"  ✓ Shape: {batch.full_rgb.shape}")
-            print(f"  ✓ Range: [{batch.full_rgb.min():.3f}, {batch.full_rgb.max():.3f}]")
-            if batch.bboxes is not None:
-                print(f"  ✓ Bounding boxes (xyxy): {batch.bboxes.shape}")
-                for i, bbox in enumerate(batch.bboxes[:2]):
-                    print(f"    Sample {i}: [{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]")
-        
-        # Object info
-        print(f"\nQuery objects:")
+        print(f"\n✓ Initializing dataset...")
         try:
-            if hasattr(batch.infos, 'infos'):
-                for i in range(len(batch.infos.infos)):
-                    label = batch.infos.infos.iloc[i]['label']
-                    print(f"  Sample {i}: {label}")
-            else:
-                print(f"  Info format: {type(batch.infos)}")
+            template_config = {
+                'dir': str(project_root / "datasets" / "templates"),
+                'level_templates': 1,
+                'pose_distribution': 'all',
+                'scale_factor': 10.0 if test_config['is_train'] else 1.0,
+                'num_templates': 162,
+                'pose_name': 'object_poses/OBJECT_ID.npy',
+            }
+            # make template_config a "hydra-like" config dict
+            from omegaconf import OmegaConf
+            template_config = OmegaConf.create(template_config)
+            vis_dir = save_dir / f"vis_{dataset_name}_{'train' if test_config['is_train'] else 'val'}"
+            Path(vis_dir).mkdir(parents=True, exist_ok=True)
+            # Use VPOGDataset with appropriate mode
+            dataset = VPOGDataset(
+                root_dir=str(project_root / "datasets"),
+                dataset_name=dataset_name,
+                template_config=template_config,
+                mode='train' if test_config['is_train'] else 'val',
+                num_positive_templates=3,
+                num_negative_templates=2,
+                min_negative_angle_deg=90.0,
+                d_ref_random_ratio=0.0,
+                patch_size=16,
+                image_size=224,
+                flow_config={
+                    'compute_visibility': True,
+                    'compute_patch_visibility': True,
+                    'visibility_threshold': 0.1,
+                },
+                # batch_size=2,
+                depth_scale=10.0 if test_config['is_train'] else 10.0,
+                seed=SEED,
+                # debug=True,  # Enable detailed flow/correspondence visualization
+                # vis_dir=vis_dir,
+            )
+            print(f"✓ Dataset initialized successfully")
+            print(f"  - TemplateDataset: {len(dataset.template_dataset)} templates")
+            print(f"  - Num templates per query: {dataset.num_templates}")
         except Exception as e:
-            print(f"  Could not extract labels: {e}")
+            print(f"✗ Failed to initialize dataset: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
         
-    except Exception as e:
-        print(f"✗ Failed to load batch: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # Visualize batch (simple version - full viz in test_vpog_labels.py)
-    print(f"\n✓ Generating basic visualizations...")
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
+        # Create dataloader using the web_dataloader from dataset
+        print(f"\n✓ Creating DataLoader...")
+        from src.utils.dataloader import NoneFilteringDataLoader
+        # batch_size = 2
+        batch_size = 100
+        dataloader = NoneFilteringDataLoader(
+            dataset.web_dataloader,
+            batch_size=batch_size,
+            num_workers=0,
+            collate_fn=dataset.collate_fn,
+        )
         
-        def denorm_img(tensor):
-            img = tensor.cpu().numpy()
-            mean = np.array([0.48145466, 0.4578275, 0.40821073]).reshape(3, 1, 1)
-            std = np.array([0.26862954, 0.26130258, 0.27577711]).reshape(3, 1, 1)
-            img = img * std + mean
-            img = np.transpose(img, (1, 2, 0))
-            return np.clip(img, 0, 1)
-        
-        def compute_pose_angle(pose1, pose2):
-            """Compute SO(3) angular distance between two poses"""
-            R1 = pose1[:3, :3].cpu().numpy()
-            R2 = pose2[:3, :3].cpu().numpy()
-            R_rel = R1.T @ R2
-            trace = np.trace(R_rel)
-            cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
-            angle_deg = np.rad2deg(np.arccos(cos_angle))
-            return angle_deg
-        
-        # Figure 1: Original full RGB + centered query + cropped query + templates with angles
-        fig, axes = plt.subplots(2, 8, figsize=(24, 8))
-        
-        for b in range(min(2, batch.images.shape[0])):
-            # Original full RGB with bbox
-            if batch.full_rgb is not None:
-                full_img = batch.full_rgb[b].permute(1, 2, 0).cpu().numpy()
-                axes[b, 0].imshow(np.clip(full_img, 0, 1))
-                axes[b, 0].set_title(f'Sample {b}:\nFull RGB', fontsize=9, fontweight='bold')
+        # Test batch loading
+        print(f"\n✓ Loading first batch...")
+        try:
+            batch = next(iter(dataloader))
+            
+            if batch is None:
+                print("✗ Batch is None!")
+                continue
+            
+            print(f"✓ Batch loaded successfully!")
+            print(f"\nBatch structure:")
+            print(f"  images:           {batch.images.shape} (B, S+1, 3, H, W)")
+            print(f"  masks:            {batch.masks.shape} (B, S+1, H, W)")
+            print(f"  K:                {batch.K.shape} (B, S+1, 3, 3)")
+            print(f"  poses:            {batch.poses.shape} (B, S+1, 4, 4)")
+            print(f"  coarse_flows:     {batch.coarse_flows.shape} (B, S, H_p, W_p, 2)")
+            print(f"  visibility:       {batch.visibility.shape} (B, S, H_p, W_p)")
+            print(f"  patch_cls:        {batch.patch_cls.shape} (B, S, H_p, W_p)")
+            print(f"  dense_flow:       {batch.dense_flow.shape} (B, S, H_p, W_p, ps, ps, 2)")
+            print(f"  dense_visibility: {batch.dense_visibility.shape} (B, S, H_p, W_p, ps, ps)")
+            
+            # CRITICAL: Check patch_cls values
+            print(f"\n  *** PATCH_CLS ANALYSIS ***")
+            patch_cls = batch.patch_cls
+            B, S, H_p, W_p = patch_cls.shape
+            unseen_class = H_p * W_p  # 196 for 14x14
+            
+            for b in range(B):
+                print(f"    Sample {b}:")
+                for s in range(S):
+                    cls_values = patch_cls[b, s].flatten()
+                    num_background = (cls_values == -1).sum().item()
+                    num_unseen = (cls_values == unseen_class).sum().item()
+                    num_visible = ((cls_values >= 0) & (cls_values < unseen_class)).sum().item()
+                    
+                    print(f"      Template {s}:")
+                    print(f"        Background (-1):   {num_background}/{H_p*W_p}")
+                    print(f"        Visible (0-195):   {num_visible}/{H_p*W_p}")
+                    print(f"        Unseen (196):      {num_unseen}/{H_p*W_p}")
+                    
+                    if num_visible > 0:
+                        visible_classes = cls_values[(cls_values >= 0) & (cls_values < unseen_class)]
+                        print(f"        Visible class range: [{visible_classes.min()}, {visible_classes.max()}]")
+                    
+                    # Check if ALL patches are unseen (the YCBV problem)
+                    if num_unseen == H_p * W_p:
+                        print(f"        ⚠️  WARNING: ALL patches are unseen (196)!")
+                        print(f"        This indicates the bug we're investigating")
+            
+            print(f"\n  d_ref:            {batch.d_ref.shape}")
+            print(f"  template_indices: {batch.template_indices.shape}")
+            print(f"  template_types:   {batch.template_types.shape}")
+                        
+            # Verify data ranges
+            print(f"\nData validation:")
+            print(f"  ✓ Images range: [{batch.images.min():.3f}, {batch.images.max():.3f}]")
+            print(f"  ✓ Masks range: [{batch.masks.min():.3f}, {batch.masks.max():.3f}]")
+            
+            # Count positive vs negative templates
+            num_pos = (batch.template_types == 0).sum(dim=1)
+            num_neg = (batch.template_types == 1).sum(dim=1)
+            print(f"  ✓ Positive templates per sample: {num_pos.tolist()}")
+            print(f"  ✓ Negative templates per sample: {num_neg.tolist()}")
+            
+            # Visualize batch - per-sample figures
+            print(f"\n✓ Generating per-sample visualizations...")
+            try:
+                saved_paths = viz.visualize_batch_all_samples(
+                    batch=batch,
+                    dataset_name=dataset_name,
+                    save_dir=save_dir,
+                    seed=SEED,
+                    max_templates=None,  # Show all templates
+                )
+                print(f"✓ All visualizations saved to {save_dir / 'per_sample_visualizations'}")
                 
-                # Draw bbox
-                if batch.bboxes is not None:
-                    bbox = batch.bboxes[b].cpu().numpy()
-                    rect = Rectangle((bbox[0], bbox[1]), bbox[2]-bbox[0], bbox[3]-bbox[1],
-                                   linewidth=2, edgecolor='red', facecolor='none')
-                    axes[b, 0].add_patch(rect)
-                axes[b, 0].axis('off')
-            
-            # Centered query (object-centered, before cropping)
-            # Extract just the object region from full_rgb
-            if batch.full_rgb is not None and batch.bboxes is not None:
-                bbox = batch.bboxes[b].cpu().numpy().astype(int)
-                centered_img = full_img[bbox[1]:bbox[3], bbox[0]:bbox[2], :]
-                axes[b, 1].imshow(np.clip(centered_img, 0, 1))
-                axes[b, 1].set_title(f'Centered\n(pre-crop)', fontsize=9, fontweight='bold')
-                axes[b, 1].axis('off')
-            
-            # Cropped & normalized query (final input)
-            query_img = denorm_img(batch.images[b, 0])
-            axes[b, 2].imshow(query_img)
-            axes[b, 2].set_title(f'Query\n(224x224)', fontsize=9, fontweight='bold', color='blue')
-            axes[b, 2].axis('off')
-            
-            # Templates with angles
-            query_pose = batch.poses[b, 0]
-            # First positive template is t* (nearest OOP)
-            t_star_pose = batch.poses[b, 1]  # T0 is always t*
-            
-            for s in range(min(5, batch.images.shape[1] - 1)):
-                template_pose = batch.poses[b, s+1]
-                angle_to_query = compute_pose_angle(query_pose, template_pose)
-                angle_to_tstar = compute_pose_angle(t_star_pose, template_pose)
-                template_idx = batch.template_indices[b, s].item()
-                
-                axes[b, s+3].imshow(denorm_img(batch.images[b, s+1]))
-                is_pos = batch.template_types[b, s].item() == 0
-                color = 'green' if is_pos else 'red'
-                # Show angle to t* for POS templates, angle to query for NEG templates
-                angle_display = angle_to_tstar if is_pos else angle_to_query
-                axes[b, s+3].set_title(f'T{s} ({"POS" if is_pos else "NEG"}) idx={template_idx}\nto {"t*" if is_pos else "Q"}:{angle_display:.1f}°', 
-                                      fontsize=8, color=color, fontweight='bold' if is_pos else 'normal')
-                axes[b, s+3].axis('off')
+            except Exception as e:
+                print(f"✗ Visualization failed: {e}")
+                import traceback
+                traceback.print_exc()
         
-        plt.suptitle('VPOG Batch: Full Pipeline Visualization\n' + 
-                     'Check if positive templates (POS) have smallest angles to query!',
-                     fontsize=12, fontweight='bold')
-        plt.tight_layout()
-        
-        # Save with seed in filename for traceability
-        output_filename = f'batch_with_full_rgb_seed{SEED}.png'
-        plt.savefig(save_dir / output_filename, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"✓ Visualization saved to {save_dir / output_filename}")
-        
-        # Print detailed angle information
-        print(f"\n  Template angles (POS→t*, NEG→Query):")
-        for b in range(min(2, batch.images.shape[0])):
-            query_pose = batch.poses[b, 0]
-            t_star_pose = batch.poses[b, 1]  # T0 is always t*
-            print(f"    Sample {b}:")
-            
-            for s in range(min(5, batch.images.shape[1] - 1)):
-                template_pose = batch.poses[b, s+1]
-                angle_to_query = compute_pose_angle(query_pose, template_pose)
-                angle_to_tstar = compute_pose_angle(t_star_pose, template_pose)
-                template_idx = batch.template_indices[b, s].item()
-                is_pos = batch.template_types[b, s].item() == 0
-                type_str = "POS" if is_pos else "NEG"
-                
-                if is_pos:
-                    print(f"      T{s} ({type_str}) idx={template_idx:3d}: to t*={angle_to_tstar:6.2f}° (to Q={angle_to_query:6.2f}°)")
-                else:
-                    print(f"      T{s} ({type_str}) idx={template_idx:3d}: to Q={angle_to_query:6.2f}°)")
-        
-        print(f"\n  Check that:")
-        print(f"    1. Full RGB shows the complete scene")
-        print(f"    2. Centered shows object region (red bbox)")
-        print(f"    3. Query is the cropped & normalized version")
-        print(f"    4. POS templates: T0 (t*) should have angle=0° to itself, T1/T2 should be <30° to t*")
-        print(f"    5. NEG templates have LARGE angles to query (should be >90°)")
-        print(f"    6. Same images appear each run (seed set)")
-    except Exception as e:
-        print(f"✗ Visualization failed: {e}")
-        import traceback
-        traceback.print_exc()
+        except Exception as e:
+            print(f"✗ Batch loading failed: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
     
-    # # Label visualization
-    # print(f"\n✓ Generating label visualizations...")
-    # try:
-    #     from training.dataloader.visualize_labels import LabelVisualizer
-    #     visualizer = LabelVisualizer(device="cuda" if torch.cuda.is_available() else "cpu")
-    #     label_save_path = save_dir / "labels.png"
-    #     compute_time = visualizer.visualize_batch_labels(
-    #         batch=batch,
-    #         save_path=label_save_path,
-    #         num_samples=min(2, batch.images.shape[0]),
-    #         num_random_patches=8,
-    #     )
-    # except Exception as e:
-    #     print(f"✗ Label visualization failed: {e}")
-    #     import traceback
-    #     traceback.print_exc()
-    
-    # # Test multiple batches
-    # print(f"\n✓ Testing multiple batches...")
-    # num_test_batches = 1
-    # for i, batch in enumerate(dataloader):
-    #     if i >= num_test_batches:
-    #         break
-    #     if batch is None:
-    #         print(f"  Batch {i}: None (skipped)")
-    #         continue
-    #     print(f"  Batch {i}: {batch.images.shape[0]} samples")
-    
-    # print("\n" + "=" * 80)
-    # print("✓ All VPOGTrainDataset tests passed!")
-    # print(f"✓ Full pipeline works: WebSceneDataset → Template Selection → VPOGBatch")
-    # print(f"✓ Visualizations saved to {save_dir}")
-    # print("=" * 80)
+    print("\n" + "=" * 80)
+    print("✓ Dataset comparison complete!")
+    print("Check the patch_cls analysis above to understand differences between datasets")
+    print("=" * 80)

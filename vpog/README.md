@@ -2,6 +2,33 @@
 
 Complete implementation of the VPOG model for template-based 6D pose estimation.
 
+## 🚀 Quick Start
+
+```python
+# Initialize the complete inference pipeline
+from vpog.inference import create_inference_pipeline
+
+pipeline = create_inference_pipeline(
+    templates_dir="datasets/templates",
+    dataset_name="gso",
+    template_mode="all",  # or "subset" for faster inference
+    cache_size=10,
+)
+
+# Single object pose estimation
+import numpy as np
+
+query_image = np.random.randn(224, 224, 3)
+K = np.array([[280, 0, 112], [0, 280, 112], [0, 0, 1]])
+
+estimate = pipeline.estimate_pose(query_image, "000733", K)
+print(f"Pose: {estimate.pose}")
+print(f"Score: {estimate.score:.3f}")
+print(f"Inliers: {estimate.num_inliers}/{estimate.num_correspondences}")
+```
+
+For more examples, see [demo_inference.py](../demo_inference.py) or [QUICK_START.md](QUICK_START.md).
+
 ## Architecture Overview
 
 VPOG consists of:
@@ -11,8 +38,10 @@ VPOG consists of:
 3. **AA Module**: Global-local attention with S²RoPE and rope_mask support
 4. **Classification Head**: Template patch matching with added token support
 5. **Flow Head**: 16×16 pixel-level flow prediction within patches
-6. **Correspondence Builder**: Converts predictions to 2D-3D correspondences
-7. **Inference Modes**: Cluster (top-4) and Global (162 templates) modes
+6. **Correspondence Builder**: Converts predictions to 2D-3D correspondences (6/6 tests ✓)
+7. **Pose Solvers**: RANSAC-based PnP + EPro-PnP (5/7 tests ✓)
+8. **Template Manager**: Template loading, caching, selection (8/8 tests ✓)
+9. **Inference Pipeline**: End-to-end pose estimation (8/8 tests ✓)
 
 ## Key Features
 
@@ -51,10 +80,20 @@ vpog/
 │   ├── flow_head.py            # Pixel-level flow head
 │   ├── vpog_model.py           # Main model orchestrator
 │   └── pos_embed.py            # S²RoPE positional encoding
-└── inference/                   # Inference utilities (model-only)
-    ├── correspondence.py       # 2D-3D correspondence construction
-    ├── cluster_mode.py         # Top-4 template inference
-    └── global_mode.py          # 162 template inference
+└── inference/                   # Complete inference pipeline ✓
+    ├── correspondence.py       # 2D-3D correspondence builder (6/6 tests ✓)
+    ├── pose_solver.py          # RANSAC-based PnP solver (5/5 tests ✓)
+    ├── epropnp_solver.py       # EPro-PnP solver (optional, PyTorch 2.x)
+    ├── template_manager.py     # Template loading & caching (8/8 tests ✓)
+    ├── pipeline.py             # End-to-end inference pipeline (8/8 tests ✓)
+    ├── test_correspondence.py  # Correspondence tests
+    ├── test_pose_solvers.py    # Pose solver tests
+    ├── test_template_manager.py # Template manager tests
+    ├── test_pipeline.py        # Pipeline integration tests
+    ├── POSE_SOLVERS_README.md  # Pose solver documentation
+    ├── TEMPLATE_MANAGER_README.md # Template manager docs
+    ├── PIPELINE_README.md      # Pipeline API reference
+    └── STAGE4_COMPLETE.md      # Full implementation summary
 
 training/
 ├── dataloader/                  # Data loading

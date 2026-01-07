@@ -1,396 +1,324 @@
-"""
-Flow Head for VPOG
+# vpog/models/flow_head.py
+#
+# Buddy-only flow heads with PACKED valid (q,t) pairs.
+#
+# Goal:
+#   Avoid computing dense flow for all (B,S,Nq) pairs.
+#   Instead, pack only valid pairs where patch_cls in [0..Nt-1].
+#
+# patch_cls semantics:
+#   -1            => background (ignore)
+#    0..Nt-1      => buddy template patch index (flattened)
+#    Nt (=Nq)     => object patch but unseen-in-template (ignore flow)
+#
+# Dense flow is defined in "patch coordinates":
+#   dense flow is t->q per template pixel, expressed in query-patch coords.
+#
+from __future__ import annotations
 
-Predicts 16x16 pixel-level optical flow within each patch pair.
-Flow represents Template → Query displacement with delta_x=1.0 meaning one full patch movement.
-Also outputs per-pixel confidence scores.
-"""
-
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+############### DEBUGGING UTILITIES ###############
+def first_bad_row(x: torch.Tensor) -> int | None:
+    if x.numel() == 0:
+        return None
+    bad = ~torch.isfinite(x).view(x.shape[0], -1).all(dim=1)
+    if bad.any():
+        return int(bad.nonzero(as_tuple=False)[0].item())
+    return None
 
-class FlowHead(nn.Module):
+def assert_finite(name: str, x: torch.Tensor):
+    if x is None:
+        return
+    if not torch.isfinite(x).all():
+        # try row-wise first if it looks like [M,...] or [B,...]
+        m = None
+        if x.dim() >= 2:
+            m = first_bad_row(x.view(x.shape[0], -1))
+        raise RuntimeError(f"[NaN DEBUG] {name} has non-finite values. first_bad_row={m}, shape={tuple(x.shape)}")
+##########################################################
+
+
+# -------------------------
+# Packing utilities (NO LOOPS)
+# -------------------------
+@torch.no_grad()
+def pack_valid_qt_pairs(
+    q_tokens: torch.Tensor,     # [B, Nq, C]
+    t_tokens: torch.Tensor,     # [B, S, Nt, C]  (image tokens only; no unseen)
+    patch_cls: torch.Tensor,    # [B, S, Nq]     (-1 bg, 0..Nt-1 buddy, Nt unseen)
+) -> Dict[str, torch.Tensor]:
     """
-    Flow head for predicting dense optical flow within patches.
-    
-    For each (query_patch, template_patch) pair, predict:
-    - 16x16 flow vectors (dx, dy) representing pixel displacement
-    - 16x16 confidence scores
-    
-    Flow convention:
-    - delta_x = 1.0 means displacement by one full patch (16 pixels)
-    - Flow is from Template → Query
-    - Positive dx means rightward motion, positive dy means downward
-    
-    Args:
-        dim: Feature dimension
-        patch_size: Patch size in pixels (default: 16)
-        flow_resolution: Flow prediction resolution (default: 16x16)
-        hidden_dims: List of hidden dimensions for decoder (default: [512, 256, 128])
-        use_confidence: Whether to predict confidence (default: True)
-        dropout: Dropout rate (default: 0.0)
+    Packs only valid (b,s,q)->t_idx pairs into a compact M-size batch.
+
+    Returns dict with:
+      q_tok:   [M, C]
+      t_tok:   [M, C]
+      b_idx:   [M]
+      s_idx:   [M]
+      q_idx:   [M]
+      t_idx:   [M]   (buddy template patch index in [0..Nt-1])
+      M:       scalar tensor (#pairs)
     """
-    
+    if q_tokens.dim() != 3:
+        raise ValueError(f"q_tokens must be [B,Nq,C], got {tuple(q_tokens.shape)}")
+    if t_tokens.dim() != 4:
+        raise ValueError(f"t_tokens must be [B,S,Nt,C], got {tuple(t_tokens.shape)}")
+    if patch_cls.dim() != 3:
+        raise ValueError(f"patch_cls must be [B,S,Nq], got {tuple(patch_cls.shape)}")
+
+    B, Nq, C = q_tokens.shape
+    Bt, S, Nt, Ct = t_tokens.shape
+    if Bt != B or Ct != C:
+        raise ValueError(f"Shape mismatch: q={tuple(q_tokens.shape)} t={tuple(t_tokens.shape)}")
+    if patch_cls.shape != (B, S, Nq):
+        raise ValueError(f"patch_cls must be [B,S,Nq], got {tuple(patch_cls.shape)}")
+
+    # valid iff buddy index in [0..Nt-1]
+    valid = (patch_cls >= 0) & (patch_cls < Nt)  # [B,S,Nq]
+
+    # indices of valid pairs (vectorized)
+    b_idx, s_idx, q_idx = valid.nonzero(as_tuple=True)  # each [M]
+
+    ############# for DEBUGGING
+    HW = q_tokens.shape[1]   # 196
+    Nt = t_tokens.shape[2]   # 196 or 197
+
+    # q_idx must always be in [0, HW-1]
+    if not ((q_idx >= 0).all() and (q_idx < HW).all()):
+        bad = ~((q_idx >= 0) & (q_idx < HW))
+        m = int(bad.nonzero(as_tuple=False)[0].item())
+        raise RuntimeError(f"[NaN DEBUG] q_idx out of range at m={m}: q_idx={int(q_idx[m])}, HW={HW}")
+
+    # t_idx is derived from patch_cls; compute it explicitly here for debug
+    t_idx = patch_cls[b_idx, s_idx, q_idx]  # [M] long
+
+    if not ((t_idx >= 0).all() and (t_idx < Nt).all()):
+        bad = ~((t_idx >= 0) & (t_idx < Nt))
+        m = int(bad.nonzero(as_tuple=False)[0].item())
+        raise RuntimeError(f"[NaN DEBUG] t_idx out of range at m={m}: t_idx={int(t_idx[m])}, Nt={Nt}")
+    # This is diagnostic only:
+    num_unseen = int((t_idx == HW).sum().item()) if Nt == HW + 1 else 0
+    if num_unseen > 0:
+        print(f"[NaN DEBUG] pack_valid_qt_pairs: unseen pairs included: {num_unseen}/{t_idx.numel()} (t_idx==HW)")
+    #############
+
+    if b_idx.numel() == 0:
+        # Return empty packed tensors (keep device/dtype consistent)
+        empty = q_tokens.new_empty((0, C))
+        empty_i = patch_cls.new_empty((0,), dtype=torch.long)
+        return {
+            "q_tok": empty,
+            "t_tok": empty,
+            "b_idx": empty_i,
+            "s_idx": empty_i,
+            "q_idx": empty_i,
+            "t_idx": empty_i,
+            "M": torch.tensor(0, device=q_tokens.device),
+        }
+
+    t_idx = patch_cls[b_idx, s_idx, q_idx].long()  # [M] in [0..Nt-1]
+
+    # gather q tokens: [M,C]
+    q_tok = q_tokens[b_idx, q_idx]  # advanced indexing
+
+    # gather buddy template tokens: [M,C]
+    t_tok = t_tokens[b_idx, s_idx, t_idx]
+
+    ############ DEBUGGING
+    assert_finite("packed q_tok", q_tok)
+    assert_finite("packed t_tok", t_tok)
+
+    # Pinpoint first bad packed row and print its mapping
+    bad_m_q = first_bad_row(q_tok)
+    bad_m_t = first_bad_row(t_tok)
+    if bad_m_q is not None or bad_m_t is not None:
+        m = bad_m_q if bad_m_q is not None else bad_m_t
+        print("[NaN DEBUG] BAD packed row m=", m)
+        print("  b_idx,s_idx,q_idx,t_idx =",
+            int(b_idx[m]), int(s_idx[m]), int(q_idx[m]), int(t_idx[m]))
+        raise RuntimeError("[NaN DEBUG] Non-finite token after gather in pack_valid_qt_pairs")
+    #######################
+
+    return {
+        "q_tok": q_tok,
+        "t_tok": t_tok,
+        "b_idx": b_idx.long(),
+        "s_idx": s_idx.long(),
+        "q_idx": q_idx.long(),
+        "t_idx": t_idx.long(),
+        "M": torch.tensor(int(b_idx.numel()), device=q_tokens.device),
+    }
+
+
+def _make_mlp(in_dim: int, hidden_dims: Tuple[int, ...], dropout: float, use_layernorm: bool) -> nn.Sequential:
+    layers = []
+    d = in_dim
+    for h in hidden_dims:
+        layers.append(nn.Linear(d, h, bias=True))
+        if use_layernorm:
+            layers.append(nn.LayerNorm(h))
+        layers.append(nn.GELU())
+        if dropout and dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        d = h
+    return nn.Sequential(*layers)
+
+
+def _fuse_qt_packed(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """
+    Packed fusion.
+      q: [M,C]
+      t: [M,C]
+    returns: [M,4C] as [q, t, q-t, q*t]
+    """
+    return torch.cat([q, t, q - t, q * t], dim=-1)
+
+
+# -------------------------
+# Heads
+# -------------------------
+class BuddyDenseFlowHead(nn.Module):
+    """
+    Dense flow head over PACKED valid pairs only.
+
+    forward_packed:
+      input:
+        q_tok: [M,C]
+        t_tok: [M,C]
+      output:
+        dense_flow: [M,ps,ps,2]
+        dense_b:    [M,ps,ps]    (Laplace scale, positive)
+        dense_w:    [M,ps,ps]    (= 1/(b+eps), unbounded)
+    """
+
     def __init__(
         self,
-        dim: int,
-        patch_size: int = 16,
-        flow_resolution: int = 16,
-        hidden_dims: Optional[list[int]] = None,
-        use_confidence: bool = True,
+        ps: int = 16,
+        in_dim: int = 128,
+        hidden_dims: Tuple[int, ...] = (512, 256, 128),
         dropout: float = 0.0,
+        use_layernorm: bool = True,
+        eps_b: float = 1e-4,
     ):
         super().__init__()
-        
-        self.dim = dim
-        self.patch_size = patch_size
-        self.flow_resolution = flow_resolution
-        self.use_confidence = use_confidence
-        
-        # Default hidden dims
-        if hidden_dims is None:
-            hidden_dims = [512, 256, 128]
-        
-        # Feature fusion: concatenate query and template features
-        fusion_dim = dim * 2
-        
-        # Build decoder network
-        layers = []
-        in_dim = fusion_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(in_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-            in_dim = hidden_dim
-        
-        self.decoder = nn.Sequential(*layers)
-        
-        # Flow prediction head
-        # Output: flow_resolution^2 * 2 (for dx, dy)
-        self.flow_predictor = nn.Linear(in_dim, flow_resolution * flow_resolution * 2)
-        
-        # Confidence prediction head (optional)
-        if use_confidence:
-            self.confidence_predictor = nn.Sequential(
-                nn.Linear(in_dim, flow_resolution * flow_resolution),
-                nn.Sigmoid(),  # Confidence in [0, 1]
-            )
-        else:
-            self.confidence_predictor = None
-        
-        # Initialize flow predictor with small weights (near-zero initialization)
-        nn.init.normal_(self.flow_predictor.weight, std=0.001)
-        nn.init.zeros_(self.flow_predictor.bias)
-    
-    def forward(
-        self,
-        query_features: torch.Tensor,  # [B, Nq, D]
-        template_features: torch.Tensor,  # [B, S*Nt, D]
-        num_templates_per_sample: int,  # S
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass.
-        
-        Args:
-            query_features: Query patch features [B, Nq, D]
-            template_features: Template patch features [B, S*Nt, D]
-            num_templates_per_sample: Number of selected templates S
-            
-        Returns:
-            flow: Flow predictions [B, S, Nq, flow_res, flow_res, 2]
-                  Values represent displacement in patch units (delta_x=1.0 = one patch)
-            confidence: Confidence scores [B, S, Nq, flow_res, flow_res, 1] or None
-                       Values in [0, 1], higher means more confident
-        """
-        B, Nq, D = query_features.shape
-        SNt = template_features.shape[1]
-        S = num_templates_per_sample
-        Nt = SNt // S
-        
-        # Reshape template features: [B, S*Nt, D] -> [B, S, Nt, D]
-        template_features = template_features.view(B, S, Nt, D)
-        
-        # Expand query features for broadcasting: [B, Nq, D] -> [B, 1, Nq, D] -> [B, S, Nq, D]
-        query_expanded = query_features.unsqueeze(1).expand(B, S, Nq, D)
-        
-        # For each template, compute flow for all query patches vs all template patches
-        # We want: [B, S, Nq, Nt, D] for query and template pairs
-        # But flow is only meaningful for matched pairs, so we compute flow for all pairs
-        # and let the classification head select which flows to use
-        
-        # Expand for all pairs: query [B, S, Nq, 1, D], template [B, S, 1, Nt, D]
-        query_for_pairs = query_expanded.unsqueeze(3)  # [B, S, Nq, 1, D]
-        template_for_pairs = template_features.unsqueeze(2)  # [B, S, 1, Nt, D]
-        
-        # Broadcast to [B, S, Nq, Nt, D]
-        query_for_pairs = query_for_pairs.expand(B, S, Nq, Nt, D)
-        template_for_pairs = template_for_pairs.expand(B, S, Nq, Nt, D)
-        
-        # Concatenate features
-        fused_features = torch.cat([query_for_pairs, template_for_pairs], dim=-1)  # [B, S, Nq, Nt, 2D]
-        
-        # Flatten for decoder
-        fused_flat = fused_features.view(B * S * Nq * Nt, -1)  # [B*S*Nq*Nt, 2D]
-        
-        # Decode
-        decoded = self.decoder(fused_flat)  # [B*S*Nq*Nt, hidden_dim]
-        
-        # Predict flow
-        flow_flat = self.flow_predictor(decoded)  # [B*S*Nq*Nt, flow_res^2 * 2]
-        flow_flat = flow_flat.view(B, S, Nq, Nt, self.flow_resolution, self.flow_resolution, 2)
-        
-        # Predict confidence
-        if self.use_confidence:
-            confidence_flat = self.confidence_predictor(decoded)  # [B*S*Nq*Nt, flow_res^2]
-            confidence_flat = confidence_flat.view(B, S, Nq, Nt, self.flow_resolution, self.flow_resolution, 1)
-        else:
-            confidence_flat = None
-        
-        return flow_flat, confidence_flat
-    
-    def get_flow_for_matches(
-        self,
-        flow_all: torch.Tensor,  # [B, S, Nq, Nt, flow_res, flow_res, 2]
-        matches: torch.Tensor,  # [B, S, Nq] - matched template patch indices
-        confidence_all: Optional[torch.Tensor] = None,  # [B, S, Nq, Nt, flow_res, flow_res, 1]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Extract flow predictions for matched pairs only.
-        
-        Args:
-            flow_all: Flow for all pairs [B, S, Nq, Nt, flow_res, flow_res, 2]
-            matches: Matched template indices [B, S, Nq]
-            confidence_all: Confidence for all pairs (optional)
-            
-        Returns:
-            flow_matched: Flow for matched pairs [B, S, Nq, flow_res, flow_res, 2]
-            confidence_matched: Confidence for matched pairs [B, S, Nq, flow_res, flow_res, 1] or None
-        """
-        B, S, Nq, Nt = flow_all.shape[:4]
-        
-        # Gather flow for matched indices
-        # matches: [B, S, Nq] -> [B, S, Nq, 1, 1, 1, 1]
-        matches_expanded = matches.view(B, S, Nq, 1, 1, 1, 1).expand(
-            B, S, Nq, 1, self.flow_resolution, self.flow_resolution, 2
+        self.ps = int(ps)
+        self.eps_b = float(eps_b)
+
+        fuse_dim = 4 * in_dim
+        self.backbone = _make_mlp(
+            in_dim=fuse_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            use_layernorm=use_layernorm,
         )
+        last_dim = hidden_dims[-1] if len(hidden_dims) > 0 else fuse_dim
+
+        self.flow_head = nn.Linear(last_dim, self.ps * self.ps * 2, bias=True)
+        nn.init.normal_(self.flow_head.weight, std=1e-3)
+        nn.init.zeros_(self.flow_head.bias)
+
+        self.b_head = nn.Linear(last_dim, self.ps * self.ps, bias=True)
+        nn.init.normal_(self.b_head.weight, std=1e-3)
+        nn.init.zeros_(self.b_head.bias)
+
+    def forward_packed(
+        self,
+        q_tok: torch.Tensor,   # [M,C]
+        t_tok: torch.Tensor,   # [M,C]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if q_tok.dim() != 2 or t_tok.dim() != 2:
+            raise ValueError(f"q_tok,t_tok must be [M,C]; got {tuple(q_tok.shape)}, {tuple(t_tok.shape)}")
+        if q_tok.shape != t_tok.shape:
+            raise ValueError(f"q_tok shape {tuple(q_tok.shape)} != t_tok shape {tuple(t_tok.shape)}")
         
-        # Gather
-        flow_matched = torch.gather(flow_all, 3, matches_expanded).squeeze(3)  # [B, S, Nq, flow_res, flow_res, 2]
-        
-        if confidence_all is not None:
-            conf_matches_expanded = matches.view(B, S, Nq, 1, 1, 1, 1).expand(
-                B, S, Nq, 1, self.flow_resolution, self.flow_resolution, 1
-            )
-            confidence_matched = torch.gather(confidence_all, 3, conf_matches_expanded).squeeze(3)
-        else:
-            confidence_matched = None
-        
-        return flow_matched, confidence_matched
+        ############# for DEBUGGING
+        assert_finite("dense_head q_tok input", q_tok)
+        assert_finite("dense_head t_tok input", t_tok)
+        ############################
 
 
-class LightweightFlowHead(nn.Module):
+        M, C = q_tok.shape
+        if M == 0:
+            empty_flow = q_tok.new_empty((0, self.ps, self.ps, 2))
+            empty_b = q_tok.new_empty((0, self.ps, self.ps))
+            empty_w = q_tok.new_empty((0, self.ps, self.ps))
+            return empty_flow, empty_b, empty_w
+
+        fused = _fuse_qt_packed(q_tok, t_tok)  # [M,4C]
+
+        ############# for DEBUGGING
+        assert_finite("dense_head fused", fused)
+        ############################
+
+        h = self.backbone(fused)
+
+        ############# for DEBUGGING
+        assert_finite("dense_head backbone out", h)
+        ############################
+
+        flow_flat = self.flow_head(h)  # [M, ps*ps*2]
+        b_flat = self.b_head(h)        # [M, ps*ps]
+
+        ############## for DEBUGGING
+        assert_finite("dense_head flow_flat", flow_flat)
+        assert_finite("dense_head b_flat", b_flat)
+        ############################
+
+        dense_flow = flow_flat.view(M, self.ps, self.ps, 2)
+
+        raw_b = b_flat.view(M, self.ps, self.ps)
+        dense_b = F.softplus(raw_b) + self.eps_b
+
+        dense_w = 1.0 / (dense_b + self.eps_b)  # unbounded weight
+
+        return dense_flow, dense_b, dense_w
+
+
+class CenterFlowHead(nn.Module):
     """
-    Lightweight flow head with shared decoder for query patches.
-    
-    This version processes all template patches for a query patch together,
-    reducing computation compared to the full pairwise version.
+    Optional future head for patch-center flow (q->t) over PACKED valid pairs.
+
+    forward_packed:
+      input:
+        q_tok: [M,C]
+        t_tok: [M,C]
+      output:
+        center_flow: [M,2]
     """
-    
+
     def __init__(
         self,
-        dim: int,
-        patch_size: int = 16,
-        flow_resolution: int = 16,
-        hidden_dim: int = 256,
-        use_confidence: bool = True,
+        in_dim: int,
+        hidden_dims: Tuple[int, ...] = (256, 128),
         dropout: float = 0.0,
+        use_layernorm: bool = True,
     ):
         super().__init__()
-        
-        self.dim = dim
-        self.patch_size = patch_size
-        self.flow_resolution = flow_resolution
-        self.use_confidence = use_confidence
-        
-        # Simple decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        
-        # Flow predictor
-        self.flow_predictor = nn.Linear(hidden_dim // 2, flow_resolution * flow_resolution * 2)
-        
-        # Confidence predictor
-        if use_confidence:
-            self.confidence_predictor = nn.Sequential(
-                nn.Linear(hidden_dim // 2, flow_resolution * flow_resolution),
-                nn.Sigmoid(),
-            )
-        
-        # Initialize
-        nn.init.normal_(self.flow_predictor.weight, std=0.001)
-        nn.init.zeros_(self.flow_predictor.bias)
-    
-    def forward(
-        self,
-        query_features: torch.Tensor,
-        template_features: torch.Tensor,
-        num_templates_per_sample: int,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass - same interface as FlowHead."""
-        B, Nq, D = query_features.shape
-        SNt = template_features.shape[1]
-        S = num_templates_per_sample
-        Nt = SNt // S
-        
-        # Reshape
-        template_features = template_features.view(B, S, Nt, D)
-        query_expanded = query_features.unsqueeze(1).expand(B, S, Nq, D)
-        
-        # Pairwise fusion
-        query_for_pairs = query_expanded.unsqueeze(3).expand(B, S, Nq, Nt, D)
-        template_for_pairs = template_features.unsqueeze(2).expand(B, S, Nq, Nt, D)
-        fused = torch.cat([query_for_pairs, template_for_pairs], dim=-1)
-        
-        # Process
-        fused_flat = fused.view(B * S * Nq * Nt, -1)
-        decoded = self.decoder(fused_flat)
-        
-        # Predict
-        flow = self.flow_predictor(decoded)
-        flow = flow.view(B, S, Nq, Nt, self.flow_resolution, self.flow_resolution, 2)
-        
-        if self.use_confidence:
-            confidence = self.confidence_predictor(decoded)
-            confidence = confidence.view(B, S, Nq, Nt, self.flow_resolution, self.flow_resolution, 1)
-        else:
-            confidence = None
-        
-        return flow, confidence
+        fuse_dim = 4 * in_dim
+        self.backbone = _make_mlp(fuse_dim, hidden_dims, dropout, use_layernorm)
+        last_dim = hidden_dims[-1] if len(hidden_dims) > 0 else fuse_dim
 
+        self.head = nn.Linear(last_dim, 2, bias=True)
+        nn.init.normal_(self.head.weight, std=1e-3)
+        nn.init.zeros_(self.head.bias)
 
-def build_flow_head(
-    head_type: str = "full",  # "full" or "lightweight"
-    dim: int = 768,
-    patch_size: int = 16,
-    flow_resolution: int = 16,
-    **kwargs,
-) -> nn.Module:
-    """
-    Build flow head.
-    
-    Args:
-        head_type: "full" (multi-layer decoder) or "lightweight" (simpler decoder)
-        dim: Feature dimension
-        patch_size: Patch size
-        flow_resolution: Flow prediction resolution
-        **kwargs: Additional arguments
-        
-    Returns:
-        head: Flow head module
-    """
-    if head_type == "full":
-        return FlowHead(
-            dim=dim,
-            patch_size=patch_size,
-            flow_resolution=flow_resolution,
-            **kwargs,
-        )
-    elif head_type == "lightweight":
-        return LightweightFlowHead(
-            dim=dim,
-            patch_size=patch_size,
-            flow_resolution=flow_resolution,
-            **kwargs,
-        )
-    else:
-        raise ValueError(f"Unknown head_type: {head_type}")
+    def forward_packed(self, q_tok: torch.Tensor, t_tok: torch.Tensor) -> torch.Tensor:
+        if q_tok.dim() != 2 or t_tok.dim() != 2:
+            raise ValueError(f"q_tok,t_tok must be [M,C]; got {tuple(q_tok.shape)}, {tuple(t_tok.shape)}")
+        if q_tok.shape != t_tok.shape:
+            raise ValueError(f"q_tok shape {tuple(q_tok.shape)} != t_tok shape {tuple(t_tok.shape)}")
 
+        M, _ = q_tok.shape
+        if M == 0:
+            return q_tok.new_empty((0, 2))
 
-if __name__ == "__main__":
-    print("Testing Flow Head...")
-    
-    # Test configuration
-    batch_size = 2
-    num_query_patches = 196  # 14x14
-    num_templates = 4  # S
-    num_patches_per_template = 196  # Nt
-    dim = 768
-    flow_resolution = 16
-    
-    # Create features
-    query_features = torch.randn(batch_size, num_query_patches, dim)
-    template_features = torch.randn(batch_size, num_templates * num_patches_per_template, dim)
-    
-    # Test full flow head
-    print("\n=== Testing Full Flow Head ===")
-    head_full = build_flow_head(
-        head_type="full",
-        dim=dim,
-        flow_resolution=flow_resolution,
-        use_confidence=True,
-    )
-    
-    flow, confidence = head_full(query_features, template_features, num_templates)
-    print(f"Query: {query_features.shape}")
-    print(f"Templates: {template_features.shape}")
-    print(f"Flow: {flow.shape}")  # [B, S, Nq, Nt, flow_res, flow_res, 2]
-    print(f"Confidence: {confidence.shape}")  # [B, S, Nq, Nt, flow_res, flow_res, 1]
-    
-    # Check flow statistics
-    print(f"\nFlow statistics:")
-    print(f"  Mean: {flow.mean().item():.4f}")
-    print(f"  Std: {flow.std().item():.4f}")
-    print(f"  Min: {flow.min().item():.4f}")
-    print(f"  Max: {flow.max().item():.4f}")
-    
-    print(f"Confidence statistics:")
-    print(f"  Mean: {confidence.mean().item():.4f}")
-    print(f"  Min: {confidence.min().item():.4f}")
-    print(f"  Max: {confidence.max().item():.4f}")
-    
-    # Test flow extraction for matches
-    print("\n=== Testing Flow Extraction ===")
-    matches = torch.randint(0, num_patches_per_template, (batch_size, num_templates, num_query_patches))
-    flow_matched, conf_matched = head_full.get_flow_for_matches(flow, matches, confidence)
-    
-    print(f"Matches: {matches.shape}")
-    print(f"Matched flow: {flow_matched.shape}")  # [B, S, Nq, flow_res, flow_res, 2]
-    print(f"Matched confidence: {conf_matched.shape}")  # [B, S, Nq, flow_res, flow_res, 1]
-    
-    # Test lightweight head
-    print("\n=== Testing Lightweight Flow Head ===")
-    head_light = build_flow_head(
-        head_type="lightweight",
-        dim=dim,
-        flow_resolution=flow_resolution,
-        hidden_dim=256,
-    )
-    
-    flow_light, conf_light = head_light(query_features, template_features, num_templates)
-    print(f"Flow: {flow_light.shape}")
-    print(f"Confidence: {conf_light.shape}")
-    
-    # Test without confidence
-    print("\n=== Testing Without Confidence ===")
-    head_no_conf = FlowHead(dim=dim, flow_resolution=flow_resolution, use_confidence=False)
-    flow_nc, conf_nc = head_no_conf(query_features, template_features, num_templates)
-    print(f"Flow: {flow_nc.shape}")
-    print(f"Confidence: {conf_nc}")  # Should be None
-    
-    print("\n✓ Flow head test passed!")
+        fused = _fuse_qt_packed(q_tok, t_tok)
+        h = self.backbone(fused)
+        out = self.head(h)  # [M,2]
+        return out

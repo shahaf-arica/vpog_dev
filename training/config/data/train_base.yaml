@@ -1,0 +1,47 @@
+# Base Training Dataset Configuration
+# dataset_name will be set dynamically based on train_dataset_id
+
+root_dir: ${machine.root_dir}/datasets
+
+# Import transforms
+defaults:
+  - transforms
+
+dataloader:
+  _target_: training.dataloader.vpog_dataset.VPOGDataset
+  mode: train
+  root_dir: ${data_train.root_dir}
+  dataset_name: null  # Set dynamically by train.py based on train_dataset_id
+  depth_scale: 10.0
+  
+  # Template configuration
+  template_config:
+    dir: ${data_train.root_dir}/templates
+    level_templates: 1
+    pose_distribution: all
+    scale_factor: 10.0
+    num_templates: 162
+    pose_name: object_poses/OBJECT_ID.npy
+  
+  # Template selection
+  num_positive_templates: 5
+  num_negative_templates: 0
+  min_negative_angle_deg: 90.0
+  
+  # Image/patch settings
+  patch_size: 16
+  image_size: 224
+  
+  # Pass transforms from transforms.yaml
+  transforms:
+    normalize: ${data_train.normalize}
+    crop_transform: ${data_train.crop_transform}
+    rgb_transform: ${data_train.rgb_transform}
+    rgb_augmentation: ${data_train.rgb_augmentation}
+    inplane_augmentation: ${data_train.inplane_augmentation}
+  
+  # Data augmentation
+  enable_augmentation: true
+  
+  # Random seed for reproducibility
+  seed: ${seed}

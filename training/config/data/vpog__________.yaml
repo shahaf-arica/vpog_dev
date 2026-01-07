@@ -2,7 +2,8 @@
 # Dataloader for VPOG training with GSO dataset
 
 dataloader:
-  _target_: training.dataloader.vpog_dataset.VPOGTrainDataset
+  _target_: training.dataloader.vpog_dataset.VPOGDataset
+  mode: train
   root_dir: /data/home/ssaricha/gigapose/datasets
   dataset_name: gso
   batch_size: 2

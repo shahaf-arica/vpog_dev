@@ -1,0 +1,33 @@
+# Default loss configurations for VPOG training
+
+# Dense buddy flow loss configuration
+dense_flow:
+  _target_: training.losses.flow_loss.DenseFlowLoss
+  eps_b: 1e-4
+  eps_norm: 1e-6
+  lambda_invis: 0.1  # Invisible pixel regularization weight
+  clamp_b_min: 1e-4
+
+# Center flow loss configuration
+center_flow:
+  _target_: training.losses.flow_loss.CenterFlowLoss
+  eps_norm: 1e-6
+  loss_type: "l1"  # "l1" or "huber"
+  huber_delta: 1.0
+
+# Classification loss configuration
+classification:
+  _target_: training.losses.classification_loss.ClassificationLoss
+  cfg:
+    _target_: training.losses.classification_loss.ClassificationLossConfig
+    tau: 1.0  # Temperature for cross-entropy
+    weight_unseen: 1.0  # Weight for unseen token class
+    label_smoothing: 0.0
+    ignore_index: -1  # Ignore background patches (-1)
+
+# Loss weights (combined in LossWeights dataclass)
+weights:
+  cls: 1.0
+  dense: 1.0
+  invis_reg: 1.0
+  center: 1.0

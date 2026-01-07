@@ -1,0 +1,18 @@
+# VPOG Model with CroCo Base Encoder
+defaults:
+  - vpog
+  - encoder: croco_base
+  - _self_
+
+# Override component dimensions for Base encoder (768)
+aa_module:
+  cfg:
+    dim: 768  # CroCo Base embed_dim
+
+classification_head:
+  cfg:
+    in_dim: 768
+
+flow_head:
+  cfg:
+    in_dim: 768

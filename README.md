@@ -38,6 +38,7 @@ git checkout 388e8bddd8a5443e284a7f70ad103d03f3f461c5
 
 
 ### News 📣
+- **[December 19th, 2024]** 🆕 **VPOG Inference Pipeline Complete!** Full end-to-end inference now available with 27/29 tests passing. See [VPOG_INFERENCE_STATUS.md](VPOG_INFERENCE_STATUS.md) and [demo_inference.py](demo_inference.py) for quick start. All 4 stages implemented: Correspondence Builder, Pose Solvers, Template Manager, and Full Pipeline.
 - [May 24th, 2024] We added the instructions for running on [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/) datasets and fixed memory requirement issues.
 - [January 19th, 2024] We released the intructions for estimating pose of novel objects from a single reference image on LM-O dataset.
 - [January 11th, 2024] We released the code for both training and testing settings. We are working on the demo for custom objects including detecting novel objects with [CNOS](https://github.com/nv-nguyen/cnos) and novel object pose estimation from a single reference image by reconstructing objects with [Wonder3D](https://github.com/xxlong0/Wonder3D). Stay tuned!

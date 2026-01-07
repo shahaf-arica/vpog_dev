@@ -1,0 +1,10 @@
+Handle train datasets:
+1) Create datasets dir in location that you can load all data into.
+2) If it is not in project/datasets make project/datasets soft link into it.
+3) You should run src/scripts/download_train.py put the taget dir hardcoded.
+4) make in dataset dir gso and shapenet dir
+5) make soft link in gso and shapenet named "train_pbr_web" to the "MegaPose-GSO" and "MegaPose-ShapeNetCore".
+6) copy from "MegaPose-GSO" and "MegaPose-ShapeNetCore" both json files and put them in gso/shapenet dir.
+7) rename shapenet/gso_models.json to be models_info.json
+8) download the models into shapenet/gso via src/scripts/download_train_cad.py
+9) render templates via src/scripts/render_gso_templates.py and src/scripts/render_shapenet_templates.py

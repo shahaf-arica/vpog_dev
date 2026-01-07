@@ -1,52 +1,86 @@
-# VPOG Training Infrastructure
+# VPOG Training
 
 Training infrastructure for **VPOG (Visual Patch-wise Object pose estimation with Groups of templates)**.
 
-## Directory Structure
+## 🚀 Quick Start
+
+```bash
+# 1. Activate environment
+conda activate pose
+
+# 2. Test setup (optional but recommended)
+python training/scripts/test_training_setup.py
+
+# 3. Start training
+python training/train.py
+```
+
+**That's it!** Training will start with default settings.
+
+### Training Modes
+
+**Local Training:**
+```bash
+# Single GPU
+python training/train.py machine=local
+
+# Multi-GPU (e.g., 2 GPUs)
+python training/train.py machine=local machine.num_gpus=2
+```
+
+**SLURM Cluster:**
+```bash
+# Single node (4 GPUs)
+sbatch training/scripts/submit_slurm.sh
+
+# Multi-node (2 nodes × 4 GPUs = 8 GPUs)
+sbatch training/scripts/submit_slurm_multinode.sh
+```
+
+## 📚 Documentation
+
+- **[TRAINING_README.md](TRAINING_README.md)** - Complete training guide (local & SLURM, ~600 lines)
+- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - One-page command reference
+- **[TEST_GUIDE.md](TEST_GUIDE.md)** - Testing framework documentation
+
+## 📁 What's Included
 
 ```
 training/
-├── config/                      # Hydra configuration files
-│   ├── train.yaml              # Main training config
-│   ├── data/
-│   │   └── vpog_data.yaml      # Dataloader configuration
-│   ├── model/
-│   │   └── vpog_base.yaml      # Model configuration
-│   └── machine/
-│       ├── local.yaml          # Local machine config
-│       └── slurm.yaml          # SLURM cluster config (DDP)
+├── train.py                     # Main training script ✓
+├── lightning_module.py          # PyTorch Lightning module ✓
+├── TRAINING_README.md           # Complete training documentation ✓
+├── QUICK_REFERENCE.md           # One-page reference ✓
 │
-├── dataloader/                  # VPOG dataloader implementation
-│   ├── __init__.py
+├── config/                      # Hydra configuration files ✓
+│   ├── train.yaml              # Main training config
+│   ├── machine/                # Local/SLURM settings
+│   │   ├── local.yaml
+│   │   └── slurm.yaml
+│   ├── data/                   # Dataset configs
+│   └── model/                  # Model configs
+│
+├── scripts/                     # Helper scripts ✓
+│   ├── submit_slurm.sh        # SLURM job submission (single node)
+│   ├── submit_slurm_multinode.sh  # Multi-node training
+│   └── test_training_setup.py # Validate setup before training
+│
+├── dataloader/                  # VPOG dataloader implementation ✓
 │   ├── vpog_dataset.py         # Main dataset class
 │   ├── template_selector.py    # Template selection (S_p + S_n)
-│   ├── flow_computer.py        # Flow label computation (16×16 pixel-level)
-│   ├── vis_utils.py            # Visualization utilities
-│   ├── test_integration.py     # Dataloader integration test
-│   ├── test_pixel_flow.py      # Pixel-level flow test
-│   └── README.md               # Detailed dataloader documentation
+│   ├── flow_computer.py        # Flow label computation (16×16)
+│   └── test_integration.py     # Dataloader tests
 │
-├── losses/                      # Loss functions (training-specific)
-│   ├── __init__.py
-│   ├── classification_loss.py  # Cross-entropy loss for template matching
-│   ├── flow_loss.py            # Masked L1/Huber loss for flow
-│   ├── weight_regularization.py # L2 regularization
+├── losses/                      # Loss functions ✓
+│   ├── classification_loss.py  # Cross-entropy for template matching
+│   ├── flow_loss.py            # Masked L1/Huber for flow
 │   └── epro_pnp_loss.py        # EPro-PnP pose loss
 │
-├── visualization/               # Training visualization
-│   ├── __init__.py
-│   ├── flow_vis.py             # Flow visualization (HSV encoding)
-│   ├── test_flow_vis.py        # Visualization integration test
-│   └── VISUALIZATION_GUIDE.md  # Complete visualization documentation
-│
-├── lightning_module.py          # PyTorch Lightning training module
-├── test_vpog_full_pipeline.py   # Full VPOG pipeline integration test
-└── README.md                    # This file
+└── visualization/               # Training visualization ✓
+    └── flow_vis.py             # Flow visualization (HSV)
 ```
 
-## Quick Start
 
-### 1. Setup Environment
 
 Ensure GigaPose environment is set up:
 ```bash

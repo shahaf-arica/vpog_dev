@@ -160,27 +160,41 @@ class WebSceneDataset(SceneDataset):
         tar_files.sort()
         logger.info(f"WebSceneDataset: {len(tar_files)} shards")
         return tar_files
+    
+    def _get_row_data(self, idx: int):
+        row = self.frame_index.iloc[idx]
+        shard_fname, key = row['shard_fname'], row['key']
+        shard_fname = f"shard-{shard_fname:06d}.tar"
+        return shard_fname, key
 
     def __getitem__(self, idx: int) -> SceneObservation:
         assert self.frame_index is not None
-        row = self.frame_index.iloc[idx]
-        shard_fname, key = row.shard_fname, row.key
-        tar = tarfile.open(self.wds_dir / shard_fname)
+        shard_fname, key = self._get_row_data(idx)
+        tar = tarfile.open(self.wds_dir / str(shard_fname))
 
         sample: Dict[str, Union[bytes, str]] = dict()
-        for k in (
-            "rgb.png",
-            "segmentation.png",
-            "depth.png",
-            "infos.json",
-            "object_datas.json",
-            "camera_data.json",
-        ):
-            tar_file = tar.extractfile(f"{key}.{k}")
-            assert tar_file is not None
-            sample[k] = tar_file.read()
+        sample["__key__"] = key
+        
+        # Try to extract files - handle both training and test formats
+        file_list = [
+            "rgb.png", "rgb.jpg",  # Image
+            "depth.png", "depth.tif",  # Depth
+            "camera.json",  # Camera data
+            "gt.json", "gt_info.json", "mask_visib.json",  # Training format
+            "segmentation.png",  # Test format
+            "infos.json", "object_datas.json", "camera_data.json",  # Test format
+        ]
+        
+        for k in file_list:
+            try:
+                tar_file = tar.extractfile(f"{key}.{k}")
+                if tar_file is not None:
+                    sample[k] = tar_file.read()
+            except KeyError:
+                # File doesn't exist in this tar, skip it
+                pass
 
-        obs = load_scene_ds_obs(sample, load_depth=self.load_depth)
+        obs = load_scene_ds_obs(sample, depth_scale=self.depth_scale, load_depth=self.load_depth)
         tar.close()
         return obs
 

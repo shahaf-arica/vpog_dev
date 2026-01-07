@@ -2,12 +2,31 @@
 name: local
 
 # Hardware settings
-batch_size: 8
-num_workers: 8
+batch_size: 8  # per GPU, per dataset
+val_batch_size: 1  # per GPU (typically 1 for pose estimation)
+num_workers: 1
 gpus: 1
 
 # Root directory
 root_dir: /data/home/ssaricha/gigapose
+
+# Callbacks
+callbacks:
+  checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${checkpoint_dir}
+    filename: '{epoch:03d}-{val_loss:.4f}'
+    save_top_k: 3
+    save_last: true
+    monitor: val_loss
+    mode: min
+    every_n_epochs: 1
+    save_on_train_epoch_end: true
+    verbose: true
+  
+  lr_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
 
 # PyTorch Lightning Trainer settings
 trainer:
@@ -18,14 +37,13 @@ trainer:
   log_every_n_steps: ${log_every_n_steps}
   val_check_interval: ${val_check_interval}
   precision: 16-mixed  # Use mixed precision training
-  gradient_clip_val: 1.0
+  gradient_clip_val: 5.0  # Increased from 1.0 to handle larger gradients
+  gradient_clip_algorithm: norm
   accumulate_grad_batches: 1
-  
-  # Callbacks will be added programmatically
-  callbacks: []
+  num_sanity_val_steps: 0 #2
+  detect_anomaly: false  # Set to true for debugging NaNs (slows training)
   
   # Logging
-  logger: true
   enable_checkpointing: true
   enable_progress_bar: true
   enable_model_summary: true

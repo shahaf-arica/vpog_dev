@@ -1,0 +1,14 @@
+# DINOv2 ViT-B/14 Encoder Configuration
+_target_: vpog.models.encoder_wrapper.EncoderWrapper
+encoder_type: dinov2
+model_name: dinov2_vitb14
+pretrained: true
+freeze_encoder: false
+patch_size: 14
+img_size: 224
+
+# Architecture specs (for reference)
+# embed_dim: 768
+# depth: 12
+# num_heads: 12
+# patch_size: 14

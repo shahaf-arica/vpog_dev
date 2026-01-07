@@ -9,6 +9,7 @@ local_data/
 .vscode/
 .hydra/
 outputs/
+output/
 slurm_logs/
 None/
 huggingface/
@@ -17,6 +18,8 @@ tmp/
 datasets/
 datasets/*
 checkpoints/
+training/config/user/*
+# End Additional
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

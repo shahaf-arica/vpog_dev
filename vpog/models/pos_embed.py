@@ -478,71 +478,111 @@ class S2RopePositionalEncodingTorch(S2RopePositionalEncoding):
         )
 
 
-# ---------------------------------------------------------------
-# S2RopeSequencePositionalEncoding
-# ---------------------------------------------------------------
 class S2RopeSequencePositionalEncoding(nn.Module):
     """
-    Sequence wrapper:
-      tokens: [B,S,T,C]
-      pos:    [B,S,T,2]
-      frame_dirs:   [B,S,3]
-      frame_has_s2: [B,S] (bool)
-      ref_dirs:     [B,3]  **REQUIRED if any frame_has_s2==True**
+    Phase generator for template sequences.
+
+    Intended usage:
+      - You call forward(...) to GET PHASES (for q/k rotation inside attention),
+        not to rotate embeddings.
+      - AA will apply phases only to image-tokens (no unseen token included here).
+
+    Shapes:
+      pos:          [B, S, T, 2]    where T = H*W (image tokens only)
+      frame_dirs:   [B, S, 3]       per-template view direction (or camera dir)
+      frame_has_s2: [B, S] bool     whether S² is active per template (optional)
+      ref_dirs:     [B, 3] (or broadcastable) REQUIRED if any S² is active
+      token_s2_mask:[B, S, T] bool  optional per-token enabling mask
+
+    Returns:
+      phase_x:   [B, S, T, px] or None if px==0
+      phase_y:   [B, S, T, py] or None if py==0
+      phase_s2:  [B, S, T, F, ps] or None if S² inactive / ps==0 / frame_dirs is None
+      s2_mask:   [B, S, T] bool or None if S² inactive
     """
 
-    def __init__(self, head_dim, **kw):
+    def __init__(self, head_dim: int, **kw):
         super().__init__()
         self.head_dim = head_dim
         self.inner = S2RopePositionalEncoding(head_dim=head_dim, **kw)
 
+    @torch.no_grad()
+    def _validate_inputs(
+        self,
+        pos: torch.Tensor,
+        frame_dirs: Optional[torch.Tensor],
+        frame_has_s2: Optional[torch.Tensor],
+        token_s2_mask: Optional[torch.Tensor],
+    ):
+        # pos: [B,S,T,2]
+        assert pos.dim() == 4 and pos.size(-1) == 2, f"pos must be [B,S,T,2], got {tuple(pos.shape)}"
+        B, S, T, _ = pos.shape
+
+        if frame_dirs is not None:
+            assert frame_dirs.shape[:2] == (B, S) and frame_dirs.size(-1) == 3, \
+                f"frame_dirs must be [B,S,3], got {tuple(frame_dirs.shape)}"
+
+        if frame_has_s2 is not None:
+            assert frame_has_s2.shape == (B, S), \
+                f"frame_has_s2 must be [B,S], got {tuple(frame_has_s2.shape)}"
+
+        if token_s2_mask is not None:
+            assert token_s2_mask.shape == (B, S, T), \
+                f"token_s2_mask must be [B,S,T], got {tuple(token_s2_mask.shape)}"
+
     def forward(
         self,
-        tokens,
-        pos,
-        frame_dirs,
-        frame_has_s2,
-        ref_dirs,
-        token_s2_mask=None,
+        pos: torch.Tensor,                          # [B,S,T,2] image tokens only
+        frame_dirs: Optional[torch.Tensor] = None,  # [B,S,3]
+        frame_has_s2: Optional[torch.Tensor] = None,# [B,S] bool
+        ref_dirs: Optional[torch.Tensor] = None,    # [B,3] (or broadcastable)
+        token_s2_mask: Optional[torch.Tensor] = None,# [B,S,T] bool
     ):
-        B, S, T, C = tokens.shape
-        device = tokens.device
+        self._validate_inputs(pos, frame_dirs, frame_has_s2, token_s2_mask)
 
-        tokens_f = tokens.reshape(B, S * T, C)
+        B, S, T, _ = pos.shape
+        device = pos.device
+
+        # -----------------------
+        # XY phases (always well-defined for image tokens)
+        # -----------------------
         pos_f = pos.reshape(B, S * T, 2)
+        phase_x_f, phase_y_f = self.inner._xy_phases(pos_f)
+
+        phase_x = None if phase_x_f is None else phase_x_f.reshape(B, S, T, -1)
+        phase_y = None if phase_y_f is None else phase_y_f.reshape(B, S, T, -1)
+
+        # -----------------------
+        # S² phases (only if enabled)
+        # -----------------------
+        if self.inner.ps == 0 or frame_dirs is None:
+            # no spherical component
+            return phase_x, phase_y, None, None
 
         if frame_has_s2 is None:
             frame_mask = torch.ones(B, S, dtype=torch.bool, device=device)
         else:
             frame_mask = frame_has_s2.bool()
 
-        s2_active = frame_mask.any().item()
-        if s2_active and ref_dirs is None:
-            raise ValueError("ref_dirs is REQUIRED when S^2 encoding is active (Option A).")
-
-        # build per-token view dirs
-        if frame_dirs is None:
-            vdirs = None
-            s2_mask_f = None
+        if token_s2_mask is None:
+            token_mask = torch.ones(B, S, T, dtype=torch.bool, device=device)
         else:
-            vdirs = frame_dirs[:, :, None, :].expand(B, S, T, 3).reshape(B, S * T, 3)
+            token_mask = token_s2_mask.bool()
 
-            if token_s2_mask is None:
-                token_mask = torch.ones(B, S, T, dtype=torch.bool, device=device)
-            else:
-                token_mask = token_s2_mask.bool()
+        # final token-wise mask: [B,S,T]
+        final_mask = frame_mask[:, :, None] & token_mask
+        s2_mask_f = final_mask.reshape(B, S * T)  # [B, S*T]
 
-            frame_mask_t = frame_mask[:, :, None].expand(B, S, T)
-            final_mask = frame_mask_t & token_mask
-            s2_mask_f = final_mask.reshape(B, S * T)
+        # Expand per-template dirs to per-token dirs without loops:
+        # frame_dirs: [B,S,3] -> [B,S,T,3] -> [B,S*T,3]
+        vdirs = frame_dirs[:, :, None, :].expand(B, S, T, 3).reshape(B, S * T, 3)
 
-        out_f = self.inner(
-            tokens_f,
-            pos_f,
+        # Compute spherical phases for flattened tokens.
+        phase_s2_f = self.inner._s2_phases(
             view_dirs=vdirs,
             ref_dirs=ref_dirs,
             s2_mask=s2_mask_f,
         )
+        phase_s2 = None if phase_s2_f is None else phase_s2_f.reshape(B, S, T, self.inner.n_faces, -1)
 
-        return out_f.reshape(B, S, T, C)
-# ---------------------------------------------------------------
+        return phase_x, phase_y, phase_s2, final_mask

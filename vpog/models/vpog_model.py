@@ -1,347 +1,209 @@
 """
 VPOG Model - Visual Patch-wise Object pose estimation with Groups of templates
 
-Main model that orchestrates:
-1. CroCo Encoder - Extract patch features
-2. AA Module - Attention aggregation with S²RoPE for templates, RoPE2D for query
-3. Classification Head - Match query patches to template patches + unseen
-4. Flow Head - Predict 16x16 pixel-level flow
+This version matches the updated AA contract:
+  - Query tokens:    [B, HW, C]
+  - Template tokens: [B, S, HW+1, C]  (one unseen token appended PER template, owned by VPOGModel)
+
+AA responsibilities (implemented in vpog.models.aa_module):
+  - Global:
+      * Query image tokens -> RoPE2D
+      * Template image tokens -> S^2-RoPE if enabled, else RoPE2D
+      * Unseen token participates but receives NO positional encoding
+  - Local:
+      * Query: RoPE2D over image tokens
+      * Template: window attention over (window image tokens + unseen), RoPE2D only on image tokens
+
+Heads are kept backward-compatible via reshaping:
+  - ClassificationHead gets templates flattened to [B, S*(HW+1), C]
+  - FlowHead gets template *image* tokens flattened to [B, S*HW, C]
+
+Note: TokenManager is intentionally removed from the forward path.
 """
 
-import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
+
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-# Import VPOG components
-from vpog.models.encoder_wrapper import EncoderWrapper
-from vpog.models.aa_module import AAModule
-from vpog.models.classification_head import ClassificationHead
-from vpog.models.flow_head import FlowHead
-from vpog.models.token_manager import TokenManager
-
-# Import S²RoPE positional encoding
-from vpog.models.pos_embed import S2RopeSequencePositionalEncoding
 
 
 class VPOGModel(nn.Module):
-    """
-    VPOG Model: Visual Patch-wise Object pose estimation with Groups of templates
-    
-    Architecture:
-    1. Encode query and template images → patch features
-    2. **Add special tokens** (e.g., unseen) to sequences via TokenManager
-    3. Apply AA module with appropriate positional encodings
-       - Templates: S²RoPE (spherical encoding based on viewpoint) for patches
-       - Query: RoPE2D (2D spatial encoding) for patches
-       - **Added tokens: NO positional encoding** (rope_mask controls this)
-    4. Classification head: match query patches to template patches + added tokens
-    5. Flow head: predict dense 16×16 flow for each matched pair
-    
-    Args:
-        encoder_config: Configuration for CroCo encoder
-        aa_config: Configuration for AA module
-        classification_config: Configuration for classification head
-        flow_config: Configuration for flow head
-        num_query_added_tokens: Number of special tokens for query (default: 0)
-        num_template_added_tokens: Number of special tokens per template (default: 1 for unseen)
-        img_size: Input image size (default: 224)
-        patch_size: Patch size (default: 16)
-    """
-    
     def __init__(
         self,
-        encoder: nn.Module,  # Hydra-instantiated encoder
-        aa_module: nn.Module,  # Hydra-instantiated AA module
-        classification_head: nn.Module,  # Hydra-instantiated classification head
-        flow_head: nn.Module,  # Hydra-instantiated flow head
-        token_manager: nn.Module,  # Hydra-instantiated token manager
-        s2rope_config: Dict,  # Config for S²RoPE
+        encoder: nn.Module,
+        aa_module: nn.Module,
+        classification_head: nn.Module,
+        dense_flow_head: nn.Module,
+        # center_flow_head: nn.Module, # Currently unused
         img_size: int = 224,
         patch_size: int = 16,
+        use_s2rope: bool = True,
+        assert_pos2d_match: bool = False,
     ):
         super().__init__()
-        
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.grid_size = (img_size // patch_size, img_size // patch_size)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-        
-        # Use Hydra-instantiated components
+
         self.encoder = encoder
         self.aa_module = aa_module
         self.classification_head = classification_head
-        self.flow_head = flow_head
-        self.token_manager = token_manager
+        # self.center_flow_head = center_flow_head
+        self.dense_flow_head = dense_flow_head
+
+        self.img_size = int(img_size)
+        self.patch_size = int(patch_size)
+        self.use_s2rope = bool(use_s2rope)
+        self.assert_pos2d_match = bool(assert_pos2d_match)
+
+        if hasattr(encoder, "grid_size"):
+            self.grid_size = tuple(getattr(encoder, "grid_size"))
+        else:
+            self.grid_size = (self.img_size // self.patch_size, self.img_size // self.patch_size)
+
+        self.num_patches = int(self.grid_size[0] * self.grid_size[1])
+
+        # Initialize learnable unseen token
+        # Get dimension from encoder
+        if hasattr(encoder, 'embed_dim'):
+            dim = encoder.embed_dim
+        elif hasattr(encoder, 'enc') and hasattr(encoder.enc, 'embed_dim'):
+            dim = encoder.enc.embed_dim
+        else:
+            raise ValueError("Cannot determine embedding dimension from encoder")
         
-        # S²RoPE positional encoding for templates
-        # This is used to generate phase encodings for AA module
-        self.s2rope_pos_encoding = S2RopeSequencePositionalEncoding(
-            head_dim=s2rope_config['head_dim'],
-            n_faces=s2rope_config.get('n_faces', 6),
-        )
-    
+        # Create learnable unseen token parameter [1, 1, 1, dim]
+        self._template_unseen_token = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        nn.init.trunc_normal_(self._template_unseen_token, std=0.02)
+
+    @property
+    def template_unseen_token(self) -> nn.Parameter:
+        return self._template_unseen_token
+
     def forward(
         self,
-        query_images: torch.Tensor,  # [B, 3, H, W]
-        template_images: torch.Tensor,  # [B, S, 3, H, W]
-        query_poses: torch.Tensor,  # [B, 4, 4]
-        template_poses: torch.Tensor,  # [B, S, 4, 4]
-        ref_dirs: torch.Tensor,  # [B, 3] - reference direction for S²RoPE
-        return_all: bool = False,
+        query_images: torch.Tensor,                      # [B,3,H,W]
+        template_images: torch.Tensor,                   # [B,S,3,H,W]
+        # query_poses: Optional[torch.Tensor] = None,      # [B,4,4]
+        template_poses: Optional[torch.Tensor] = None,   # [B,S,4,4]
+        # ref_dirs: Optional[torch.Tensor] = None,         # [B,3] (required if use_s2rope=True)
+        # patch_cls: Optional[torch.Tensor] = None,        # [B,S,Nq] required
+        # return_all: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass.
-        
-        Args:
-            query_images: Query images [B, 3, H, W]
-            template_images: Template images [B, S, 3, H, W]
-            query_poses: Query object poses [B, 4, 4]
-            template_poses: Template object poses [B, S, 4, 4]
-            ref_dirs: Reference directions for S²RoPE [B, 3]
-            return_all: If True, return intermediate features
-            
-            Returns:
-            Dictionary containing:
-            - classification_logits: [B, S, Nq, Nt+num_template_added_tokens]
-            - flow: [B, S, Nq, Nt, 16, 16, 2]
-            - flow_confidence: [B, S, Nq, Nt, 16, 16, 1]
-            - (optional) query_features, template_features, added_features, etc.
-        """
         B, S = template_images.shape[:2]
-        
-        # 1. Encode query image
-        query_features, query_pos2d = self.encoder(query_images)  # [B, Nq, D], [B, Nq, 2]
-        Nq = query_features.shape[1]
-        assert Nq == self.num_patches, f"Expected {self.num_patches} patches, got {Nq}"
-        
-        # 2. Encode template images
-        # Reshape: [B, S, 3, H, W] -> [B*S, 3, H, W]
-        template_images_flat = template_images.reshape(B * S, 3, self.img_size, self.img_size)
-        template_features_flat, template_pos2d_flat = self.encoder(template_images_flat)
-        # [B*S, Nt, D], [B*S, Nt, 2]
-        
-        Nt = template_features_flat.shape[1]
-        assert Nt == self.num_patches, f"Expected {self.num_patches} patches per template, got {Nt}"
-        
-        # Reshape back: [B*S, Nt, D] -> [B, S, Nt, D] -> [B, S*Nt, D]
-        template_features = template_features_flat.reshape(B, S, Nt, -1).reshape(B, S * Nt, -1)
-        template_pos2d = template_pos2d_flat.reshape(B, S, Nt, 2).reshape(B, S * Nt, 2)
-        
-        # 3. Compute S²RoPE phases for templates
-        # Extract view directions from poses (third column of rotation matrix)
-        # template_poses: [B, S, 4, 4]
-        template_view_dirs = template_poses[:, :, :3, 2]  # [B, S, 3] - viewing direction (z-axis)
-        
-        # Prepare for S²RoPE sequence encoding
-        # We need: [B, S, Nt, D] for tokens
-        template_tokens_seq = template_features_flat.reshape(B, S, Nt, -1)  # [B, S, Nt, D]
-        template_pos2d_seq = template_pos2d_flat.reshape(B, S, Nt, 2)  # [B, S, Nt, 2]
-        
-        # All templates use S² encoding
-        frame_has_s2 = torch.ones(B, S, dtype=torch.bool, device=query_images.device)
-        
-        # Apply S²RoPE positional encoding to get encoded features
-        # NOTE: This is for getting the phase encodings, we'll apply them in AA module
-        # For now, we'll compute phases separately
-        
-        # 4. Add special tokens to query (if configured)
-        # These tokens go through AA but WITHOUT positional encoding
-        query_with_tokens, query_pos_with_tokens, query_rope_mask = \
-            self.token_manager.add_query_tokens(query_features, query_pos2d)
-        # query_with_tokens: [B, Nq + num_query_added_tokens, D]
-        # query_rope_mask: [B, Nq + num_query_added_tokens] - True for patches, False for added tokens
-        
-        # 5. Apply AA module to query (with RoPE2D + rope_mask)
-        query_features_aa = self.aa_module(
-            query_with_tokens,
-            pos2d=query_pos_with_tokens,
-            rope_mask=query_rope_mask,
-            is_template=False,
+
+        q_tokens, q_pos2d = self.encoder(query_images)  # [B,Nq,C], [B,Nq,2]
+        Nq, C = q_tokens.shape[1], q_tokens.shape[2]
+        if Nq != self.num_patches:
+            self.num_patches = int(Nq)
+
+        t_imgs_flat = template_images.reshape(B * S, *template_images.shape[2:])
+        t_tokens_flat, t_pos2d_flat = self.encoder(t_imgs_flat)  # [B*S,Nt,C], [B*S,Nt,2]
+        Nt = t_tokens_flat.shape[1]
+        if Nt != Nq:
+            raise ValueError(f"Expected Nt==Nq (same patch grid), got Nt={Nt} Nq={Nq}")
+
+        t_tokens_img = t_tokens_flat.view(B, S, Nt, C)  # [B,S,Nt,C]
+
+        if self.assert_pos2d_match:
+            t_pos2d = t_pos2d_flat.view(B, S, Nt, 2)
+            if not torch.allclose(t_pos2d[:, 0], q_pos2d, atol=0.0, rtol=0.0):
+                raise AssertionError("Template pos2d grid differs from query pos2d grid.")
+
+        unseen = self.template_unseen_token.expand(B, S, 1, C)
+        t_tokens = torch.cat([t_tokens_img, unseen], dim=2)  # [B,S,Nt+1,C]
+
+        # template_frame_dirs = None
+        # template_frame_has_s2 = None
+        # if self.use_s2rope:
+        #     if template_poses is None or ref_dirs is None:
+        #         raise ValueError("use_s2rope=True requires template_poses and ref_dirs.")
+        #     template_frame_dirs = template_poses[:, :, :3, 2]  # [B,S,3]
+        #     template_frame_has_s2 = torch.ones(B, S, dtype=torch.bool, device=q_tokens.device)
+
+        # q_tokens_aa, t_tokens_aa = self.aa_module(
+        #     q_tokens=q_tokens,
+        #     t_tokens=t_tokens,
+        #     pos2d=q_pos2d,
+        #     grid_size=self.grid_size,
+        #     template_frame_dirs=template_frame_dirs,
+        #     template_frame_has_s2=template_frame_has_s2,
+        #     ref_dirs=ref_dirs,
+        # )  # q: [B,Nq,C], t: [B,S,Nt+1,C]
+
+        q_tokens_aa, t_tokens_aa = self.aa_module(
+            q_tokens=q_tokens,
+            t_tokens=t_tokens,
+            pos2d=q_pos2d,
             grid_size=self.grid_size,
-        )  # [B, Nq + num_query_added_tokens, D]
-        
-        # Remove added tokens after AA processing
-        query_features_aa, query_added_features = self.token_manager.remove_added_tokens(
-            query_features_aa, num_original=Nq, is_template=False
-        )  # query_features_aa: [B, Nq, D], query_added_features: [B, num_query_added_tokens, D]
-        
-        # 6. Add special tokens to templates (e.g., unseen token)
-        # These tokens go through AA but WITHOUT positional encoding
-        templates_with_tokens, templates_pos_with_tokens, templates_rope_mask = \
-            self.token_manager.add_template_tokens(template_tokens_seq, template_pos2d_seq, num_templates=S)
-        # templates_with_tokens: [B, S*(Nt + num_template_added_tokens), D]
-        # templates_rope_mask: [B, S*(Nt + num_template_added_tokens)] - True for patches, False for added tokens
-        
-        # 7. Apply AA module to templates (with S²RoPE + rope_mask)
-        # Reshape from flat to per-template: [B, S*(Nt+added), D] -> [B, S, Nt+added, D]
-        Nt_with_added = (Nt + self.token_manager.num_template_added_tokens)
-        templates_with_tokens_4d = templates_with_tokens.reshape(B, S, Nt_with_added, -1)
-        templates_pos_with_tokens_4d = templates_pos_with_tokens.reshape(B, S, Nt_with_added, 2)
-        templates_rope_mask_4d = templates_rope_mask.reshape(B, S, Nt_with_added)
-        
-        # For simplicity, we'll apply AA to each template separately
-        template_features_aa_list = []
-        
-        for s in range(S):
-            template_s = templates_with_tokens_4d[:, s, :, :]  # [B, Nt + added, D]
-            pos2d_s = templates_pos_with_tokens_4d[:, s, :, :]  # [B, Nt + added, 2]
-            rope_mask_s = templates_rope_mask_4d[:, s, :]  # [B, Nt + added]
-            view_dir_s = template_view_dirs[:, s, :]  # [B, 3]
-            
-            # Compute S²RoPE phases (this is a simplified version)
-            # In practice, you'd extract phase_x, phase_y, phase_sph from s2rope_pos_encoding
-            # For now, we'll use None and handle it in AA module
-            # TODO: Properly compute S²RoPE phases
-            
-            template_s_aa = self.aa_module(
-                template_s,
-                pos2d=pos2d_s,  # Also provide 2D positions for local attention
-                rope_mask=rope_mask_s,  # Skip RoPE for added tokens
-                is_template=True,
-                grid_size=self.grid_size,
-                # phase_x, phase_y, phase_sph would go here
-            )  # [B, Nt + added, D]
-            
-            template_features_aa_list.append(template_s_aa)
-        
-        # Stack templates: [B, S, Nt+added, D]
-        template_features_aa_stacked = torch.stack(template_features_aa_list, dim=1)
-        
-        # Flatten for token removal: [B, S, Nt+added, D] -> [B, S*(Nt+added), D]
-        B_aa, S_aa, Nt_added_aa, D_aa = template_features_aa_stacked.shape
-        template_features_aa_flat = template_features_aa_stacked.reshape(B_aa, S_aa * Nt_added_aa, D_aa)
-        
-        # Remove added tokens after AA processing (per template)
-        # This gives us [B, S*Nt, D] for patches and [B, S, num_template_added_tokens, D] for added
-        template_features_aa, template_added_features = self.token_manager.remove_added_tokens(
-            template_features_aa_flat, num_original=S*Nt, is_template=True, num_templates=S
-        )
-        # template_features_aa: [B, S*Nt, D] - flattened
-        # template_added_features: [B, S, num_template_added_tokens, D]
-        
-        # Reshape template_features_aa to 4D: [B, S*Nt, D] -> [B, S, Nt, D]
-        template_features_aa_4d = template_features_aa.reshape(B, S, Nt, -1)
-        
-        # 8. Classification head
-        # NOTE: Added tokens (e.g., unseen) have already gone through AA module
-        # Now we need to concatenate them back for classification
-        # Classification expects: query [B, Nq, D] and templates [B, S*(Nt+added), D]
-        
-        # Concatenate added tokens back to each template: [B, S, Nt, D] + [B, S, added, D] -> [B, S, Nt+added, D]
-        template_features_with_added = torch.cat([template_features_aa_4d, template_added_features], dim=2)
-        # Flatten: [B, S, Nt+added, D] -> [B, S*(Nt+added), D]
-        template_features_for_classification = template_features_with_added.reshape(B, S * (Nt + self.token_manager.num_template_added_tokens), -1)
-        
-        classification_logits = self.classification_head(
-            query_features_aa,
-            template_features_for_classification,
-            num_templates_per_sample=S,
-        )  # [B, S, Nq, Nt+added]
-        
-        # 9. Flow head
-        # Flow only works on patch-to-patch matches (not added tokens)
-        flow, flow_confidence = self.flow_head(
-            query_features_aa,
-            template_features_aa,  # [B, S*Nt, D] - Only patches, no added tokens
-            num_templates_per_sample=S,
-        )  # flow: [B, S, Nq, Nt, 16, 16, 2], confidence: [B, S, Nq, Nt, 16, 16, 1]
-        
-        # Squeeze the last dimension of confidence: [B, S, Nq, Nt, 16, 16, 1] -> [B, S, Nq, Nt, 16, 16]
-        flow_confidence = flow_confidence.squeeze(-1)
-        
-        # Prepare output
-        output = {
-            'classification_logits': classification_logits,
-            'flow': flow,
-            'flow_confidence': flow_confidence,
+            template_poses=template_poses,
+        )  # q: [B,Nq,C], t: [B,S,Nt+1,C]
+
+        # classification_logits = self.classification_head(
+        #     q_tokens=q_tokens_aa,
+        #     t_tokens=t_tokens_aa,
+        # )  # [B,S,Nq,Nt+1]
+
+        # if patch_cls is None:
+        #     raise ValueError("patch_cls is required for buddy-only flow_head.")
+        # if patch_cls.shape != (B, S, Nq):
+        #     raise ValueError(f"patch_cls must be [B,S,Nq]={B,S,Nq}, got {tuple(patch_cls.shape)}")
+
+        # t_img_aa = t_tokens_aa[:, :, :Nt, :].contiguous()  # [B,S,Nt,C]
+
+        out = {
+            # "classification_logits": classification_logits,
+            "query_tokens_aa": q_tokens_aa,
+            "template_tokens_aa": t_tokens_aa,
+            "query_pos2d": q_pos2d,
+            "num_tokens_per_template": Nt,
+            "num_query_tokens": Nq,
         }
-        
-        if return_all:
-            output.update({
-                'query_features_raw': query_features,
-                'template_features_raw': template_features.reshape(B, S, Nt, -1),  # [B, S, Nt, D]
-                'query_features_aa': query_features_aa,
-                'template_features_aa': template_features_aa,  # [B, S, Nt, D]
-                'query_added_features': query_added_features,  # [B, num_query_added_tokens, D]
-                'template_added_features': template_added_features,  # [B, S, num_template_added_tokens, D]
-                'query_pos2d': query_pos2d,
-                'template_pos2d': template_pos2d.reshape(B, S, Nt, 2),  # [B, S, Nt, 2]
-            })
-        
-        return output
-    
-    def get_predictions(
-        self,
-        classification_logits: torch.Tensor,
-        flow: torch.Tensor,
-        flow_confidence: torch.Tensor,
-        confidence_threshold: float = 0.5,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Extract predictions from model outputs.
-        
-        Args:
-            classification_logits: [B, S, Nq, Nt+1]
-            flow: [B, S, Nq, Nt, 16, 16, 2]
-            flow_confidence: [B, S, Nq, Nt, 16, 16, 1]
-            confidence_threshold: Threshold for filtering predictions
-            
-        Returns:
-            Dictionary with predictions
-        """
-        # Get matched template patches
-        predictions, confidences = self.classification_head.get_predictions(classification_logits)
-        # predictions: [B, S, Nq], confidences: [B, S, Nq]
-        
-        # Get unseen mask
-        unseen_mask = self.classification_head.get_unseen_mask(
-            classification_logits,
-            threshold=confidence_threshold,
-        )  # [B, S, Nq]
-        
-        # Extract flow for matched pairs
-        flow_matched, conf_matched = self.flow_head.get_flow_for_matches(
-            flow,
-            predictions,
-            flow_confidence,
-        )  # [B, S, Nq, 16, 16, 2], [B, S, Nq, 16, 16, 1]
-        
-        return {
-            'matched_template_patches': predictions,  # [B, S, Nq]
-            'match_confidences': confidences,  # [B, S, Nq]
-            'unseen_mask': unseen_mask,  # [B, S, Nq]
-            'flow_matched': flow_matched,  # [B, S, Nq, 16, 16, 2]
-            'flow_confidence_matched': conf_matched,  # [B, S, Nq, 16, 16, 1]
-        }
+        # flow_out = self.flow_head(
+        #     q_tokens=q_tokens_aa,
+        #     t_tokens_img=t_img_aa,
+        #     patch_cls=patch_cls,
+        # )
+
+        # out: Dict[str, torch.Tensor] = {
+        #     "classification_logits": classification_logits,
+        #     "dense_flow": flow_out["dense_flow"],
+        #     "dense_b": flow_out["dense_b"],
+        #     "center_flow": flow_out["center_flow"],
+        #     "flow_valid": flow_out["valid"],
+        # }
+
+        # if return_all:
+        #     out.update(
+        #         {
+        #             "query_tokens_raw": q_tokens,
+        #             "template_tokens_img_raw": t_tokens_img,
+        #             "query_tokens_aa": q_tokens_aa,
+        #             "template_tokens_aa": t_tokens_aa,
+        #             "query_pos2d": q_pos2d,
+        #         }
+        #     )
+        return out
 
 
-def build_vpog_model(config: Dict) -> VPOGModel:
-    """
-    Build VPOG model from configuration.
-    
-    Args:
-        config: Configuration dictionary with keys:
-            - encoder: encoder configuration
-            - aa_module: AA module configuration
-            - classification_head: classification head configuration
-            - flow_head: flow head configuration
-            - img_size: image size
-            - patch_size: patch size
-            
-    Returns:
-        model: VPOGModel instance
-    """
+def build_vpog_model(
+    encoder: nn.Module,
+    aa_module: nn.Module,
+    classification_head: nn.Module,
+    flow_head: nn.Module,
+    img_size: int = 224,
+    patch_size: int = 16,
+    use_s2rope: bool = True,
+    assert_pos2d_match: bool = False,
+) -> VPOGModel:
     return VPOGModel(
-        encoder_config=config['encoder'],
-        aa_config=config['aa_module'],
-        classification_config=config['classification_head'],
-        flow_config=config['flow_head'],
-        img_size=config.get('img_size', 224),
-        patch_size=config.get('patch_size', 16),
+        encoder=encoder,
+        aa_module=aa_module,
+        classification_head=classification_head,
+        flow_head=flow_head,
+        img_size=img_size,
+        patch_size=patch_size,
+        use_s2rope=use_s2rope,
+        assert_pos2d_match=assert_pos2d_match,
     )
 
 

@@ -1,26 +1,59 @@
 # Main training configuration for VPOG
 defaults:
   - machine: local
-  - data: vpog_data
-  - model: vpog_base
+  - user: default
+  - /data@data_train: train_base  # Generic train config, dataset_name set by train_dataset_id
+  - /data@data_val: bop_core  # BOP validation config
+  - model: vpog
+  - optimizer: adamw
+  - loss: default
   - _self_
 
 # Experiment settings
-save_dir: /strg/E/shared-data/Shahaf/gigapose/vpog_experiments
-name_exp: vpog_train
+save_dir: /strg/E/shared-data/Shahaf/gigapose/outputs
+name_exp: vpog_train_dev_5
 seed: 42
 
-# Dataset selection: 0 for gso, 1 for shapenet, 2 for both
-train_dataset_id: 0
+# Logging configuration
+enable_wandb: true  # Set to true to enable WandB logging
+
+# Hydra output directory override - consolidate all outputs to save_dir
+hydra:
+  run:
+    dir: ${save_dir}/${name_exp}/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${save_dir}/${name_exp}/sweeps
+    subdir: ${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# Multi-dataset training: 0=gso, 1=shapenet, 2=gso+shapenet
+# train.py dynamically sets dataset_name based on this mapping
+train_dataset_id: 2  # Change to 2 for multi-dataset training
+train_dataset_names:
+  0: [gso]
+  1: [shapenet]
+  2: [gso, shapenet]
+
+# Validation dataset name (override: data_val.dataloader.dataset_name=tless)
+val_dataset_name: ycbv
 
 # Training parameters
-max_epochs: 100
+max_epochs: 1
 log_every_n_steps: 50
-val_check_interval: 1.0
+val_check_interval: 1.0  # Validate every epoch
 
 # Checkpoint settings
 checkpoint_dir: ${save_dir}/${name_exp}/checkpoints
 vis_dir: ${save_dir}/${name_exp}/visualizations
 
+# Loss weights (override individual weights: loss.weights.cls=2.0)
+loss_weight_cls: ${loss.weights.cls}
+loss_weight_dense: ${loss.weights.dense}
+loss_weight_invis_reg: ${loss.weights.invis_reg}
+loss_weight_center: ${loss.weights.center}
+
 # Resume training
 resume_from_checkpoint: null
+
+# Optional: limit batches for debugging
+limit_train_batches: null
+limit_val_batches: null

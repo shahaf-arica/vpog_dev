@@ -243,7 +243,7 @@ def test_rope_mask_effectiveness():
     print("TEST: rope_mask Effectiveness (Added Tokens Skip RoPE)")
     print("="*80)
     
-    from vpog.models.aa_module import AAModule
+    from vpog.models.aa_module_old import AAModule
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     

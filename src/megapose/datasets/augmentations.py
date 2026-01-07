@@ -35,6 +35,9 @@ from src.megapose.datasets.scene_dataset import Resolution, SceneObservation
 from src.megapose.datasets.utils import make_detections_from_segmentation
 from src.megapose.lib3d.camera_geometry import get_K_crop_resize
 
+from collections.abc import Iterable
+
+
 
 class SceneObservationTransform:
     def __call__(self, obs: SceneObservation) -> SceneObservation:
@@ -55,7 +58,7 @@ class SceneObservationAugmentation(SceneObservationTransform):
     def __call__(self, obs: SceneObservation) -> SceneObservation:
         assert obs.rgb is not None
         if random.random() <= self.p:
-            if isinstance(self.transform, list):
+            if isinstance(self.transform, Iterable):
                 for transform_ in self.transform:
                     obs = transform_(obs)
             else:
