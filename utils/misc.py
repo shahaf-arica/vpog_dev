@@ -23,7 +23,7 @@ from utils.structs import AlignedBox2f, CameraModel, PinholePlaneCameraModel
 
 from utils.geometry import transform_3d_points_numpy, gen_look_at_matrix
 
-logger: logging.Logger = logging.get_logger()
+# logger: logging.Logger = logging.get_logger(__name__)
 
 
 class Timer:
@@ -38,7 +38,7 @@ class Timer:
     def elapsed(self, msg="Elapsed") -> Optional[float]:
         if self.enabled:
             elapsed = time.time() - self.start_time
-            logger.info(f"{msg}: {elapsed:.5f}s")
+            # logger.info(f"{msg}: {elapsed:.5f}s")
             return elapsed
         else:
             return None

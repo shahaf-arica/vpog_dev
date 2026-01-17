@@ -1,0 +1,46 @@
+# BOP Test Configuration for VPOG
+
+# Model checkpoint
+checkpoint_path: /path/to/vpog_checkpoint.ckpt
+
+# Paths
+root_dir: /path/to/bop/datasets  # BOP datasets root
+templates_dir: /path/to/templates  # Rendered templates directory
+output_dir: ./test_results  # Output directory
+
+# Test settings
+dataset_name: ycbv  # BOP dataset to test on
+test_setting: localization  # "localization" (use test_targets) or "detection" (all detections)
+
+# VPOG Inference parameters
+inference:
+  device: cuda
+  ransac_threshold: 8.0  # RANSAC inlier threshold (pixels)
+  ransac_iterations: 1000
+  ransac_confidence: 0.99
+  min_inliers: 4
+  template_mode: all  # "all" or "subset"
+  cache_size: 10  # Number of objects to cache in memory
+
+# Data loading
+batch_size: 1  # Keep at 1 for testing
+num_workers: 4
+image_size: 224  # Input image size
+
+# Output
+model_name: vpog
+run_id: test  # Run identifier for output files
+
+# Evaluation
+evaluate: true  # Run BOP evaluation after testing
+renderer_type: vispy  # Renderer for VSD computation ("vispy", "python", or "cpp")
+
+# Datasets to test (for multi-dataset testing)
+test_datasets:
+  - lmo
+  - tudl
+  - icbin
+  - tless
+  - ycbv
+  - itodd  # No GT available
+  - hb  # No GT available

@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import numpy as np
+import cv2
 
 from training.losses.flow_loss import (
     DenseFlowLoss,
@@ -21,6 +23,8 @@ from training.losses.classification_loss import ClassificationLoss, Classificati
 from src.utils.logging import get_logger
 
 from vpog.models.flow_head import pack_valid_qt_pairs
+from utils.bop_evaluation import BOPEvaluator
+from vpog.inference.correspondence import CorrespondenceBuilder
 
 logger = get_logger(__name__)
 
@@ -56,6 +60,8 @@ class VPOGLightningModule(pl.LightningModule):
         use_param_groups: bool = False,
         backbone_lr_multiplier: float = 0.1,
         new_components_lr_multiplier: float = 1.0,
+        enable_pose_eval: bool = True,
+        dataset_name: str = "ycbv",  # BOP dataset name for pose evaluation
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -74,6 +80,23 @@ class VPOGLightningModule(pl.LightningModule):
         self.use_center_flow = use_center_flow
 
         assert not self.use_center_flow or (self.central_flow_loss is not None), "Center flow loss must be provided if use_center_flow is True"
+        
+        # BOP evaluation for validation
+        self.enable_pose_eval = enable_pose_eval
+        self.bop_evaluator = None
+        self.correspondence_builder = None
+        if self.enable_pose_eval:
+            try:
+                self.bop_evaluator = BOPEvaluator(dataset_name=dataset_name)
+                self.correspondence_builder = CorrespondenceBuilder(
+                    img_size=224,
+                    patch_size=16,
+                    grid_size=(14, 14),
+                )
+                logger.info(f"BOP evaluator initialized for dataset: {dataset_name}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize BOP evaluator: {e}. Pose metrics disabled.")
+                self.enable_pose_eval = False
 
     @staticmethod
     def _flatten_patch_grid(x: torch.Tensor) -> torch.Tensor:
@@ -158,10 +181,10 @@ class VPOGLightningModule(pl.LightningModule):
         # GT flatten
         # -------------------------
         patch_cls = self._flatten_patch_grid(batch.patch_cls).long()        # [B,S,Nq]
-        gt_dense_all = self._flatten_patch_grid(batch.dense_flow).float()   # [B,S,Nt,ps,ps,2]  (stored per TEMPLATE patch)
+        gt_dense_all = self._flatten_patch_grid(batch.dense_flow).float()   # [B,S,Nq,ps,ps,2]  (stored per QUERY patch, Design B)
 
         # visibility/weight for dense pixels:
-        gt_vis_all = self._flatten_patch_grid(batch.dense_visibility).float()  # [B,S,Nt,ps,ps]
+        gt_vis_all = self._flatten_patch_grid(batch.dense_visibility).float()  # [B,S,Nq,ps,ps]
         
         B, S, Nq = patch_cls.shape
         _, _, Nt, ps, ps2, _ = gt_dense_all.shape
@@ -188,11 +211,13 @@ class VPOGLightningModule(pl.LightningModule):
         t_tok = pack["t_tok"]   # [M,C]
         b_idx = pack["b_idx"]   # [M]
         s_idx = pack["s_idx"]   # [M]
+        q_idx = pack["q_idx"]   # [M]  (query patch index)
         t_idx = pack["t_idx"]   # [M]  (buddy template patch index)
 
-        # Gather GT dense flow/vis by buddy template patch index (t_idx)
-        gt_flow = gt_dense_all[b_idx, s_idx, t_idx]  # [M,ps,ps,2]
-        gt_vis = gt_vis_all[b_idx, s_idx, t_idx]     # [M,ps,ps]
+        # Gather GT dense flow/vis by QUERY patch index (q_idx) - Design B storage
+        # GT is stored as dense_flow[b,s,q] = flow from buddy_template(q) → query_patch(q)
+        gt_flow = gt_dense_all[b_idx, s_idx, q_idx]  # [M,ps,ps,2]
+        gt_vis = gt_vis_all[b_idx, s_idx, q_idx]     # [M,ps,ps]
 
         # Dense head only on packed pairs
         pred_flow, pred_b, pred_w = self.model.dense_flow_head.forward_packed(q_tok, t_tok)
@@ -352,49 +377,400 @@ class VPOGLightningModule(pl.LightningModule):
         if batch is None:
             logger.warning(f"Validation batch {batch_idx} is None, skipping...")
             return None
+        dtype = torch.bfloat16
+        with torch.cuda.amp.autocast(dtype=dtype):
+            outputs = self.forward(batch)
 
-        outputs = self.forward(batch)
-
-        patch_cls = self._flatten_patch_grid(batch.patch_cls).long()        # [B,S,Nq]
-        gt_dense_all = self._flatten_patch_grid(batch.dense_flow).float()   # [B,S,Nt,ps,ps,2]
+        # GT labels for loss computation only
+        patch_cls_gt = self._flatten_patch_grid(batch.patch_cls).long()        # [B,S,Nq]
+        gt_dense_all = self._flatten_patch_grid(batch.dense_flow).float()   # [B,S,Nq,ps,ps,2]  (stored per QUERY patch, Design B)
         if hasattr(batch, "dense_visibility") and batch.dense_visibility is not None:
-            gt_vis_all = self._flatten_patch_grid(batch.dense_visibility).float()
+            gt_vis_all = self._flatten_patch_grid(batch.dense_visibility).float()  # [B,S,Nq,ps,ps]
         else:
-            gt_vis_all = self._flatten_patch_grid(batch.dense_weight).float()
+            gt_vis_all = self._flatten_patch_grid(batch.dense_weight).float()  # [B,S,Nq,ps,ps]
 
-        cls_stats = self.cls_loss(outputs["classification_logits"], patch_cls)
+        # Classification loss (compare predictions vs GT)
+        cls_stats = self.cls_loss(outputs["classification_logits"], patch_cls_gt)
         loss_cls = cls_stats["loss_cls"]
 
-        pack = pack_valid_qt_pairs(outputs["q_tokens_aa"], outputs["t_img_aa"], patch_cls)
-        b_idx, s_idx, t_idx = pack["b_idx"], pack["s_idx"], pack["t_idx"]
+        # CRITICAL: Use PREDICTED classifications for correspondence building (not GT!)
+        # This simulates real inference where GT is unavailable
+        patch_cls_pred = outputs["classification_logits"].argmax(dim=-1)  # [B,S,Nq]
+        pack = pack_valid_qt_pairs(outputs["q_tokens_aa"], outputs["t_img_aa"], patch_cls_pred)
+        b_idx, s_idx, q_idx, t_idx = pack["b_idx"], pack["s_idx"], pack["q_idx"], pack["t_idx"]
 
-        gt_flow = gt_dense_all[b_idx, s_idx, t_idx]
-        gt_vis = gt_vis_all[b_idx, s_idx, t_idx]
+        # Gather GT by QUERY patch index (q_idx) - Design B storage
+        gt_flow = gt_dense_all[b_idx, s_idx, q_idx]  # [M,ps,ps,2]
+        gt_vis = gt_vis_all[b_idx, s_idx, q_idx]     # [M,ps,ps]
+        
 
-        pred_flow, pred_b, _ = self.model.dense_flow_head.forward_packed(pack["q_tok"], pack["t_tok"])
-
-        dense_stats = self.dense_flow_loss(
-            pred_flow=pred_flow,
-            pred_b=pred_b,
-            gt_flow=gt_flow,
-            gt_vis=gt_vis,
-            return_pnp_weights=False,
-        )
+        with torch.cuda.amp.autocast(dtype=dtype):
+            pred_flow, pred_b, _ = self.model.dense_flow_head.forward_packed(pack["q_tok"], pack["t_tok"])
+            dense_stats = self.dense_flow_loss(
+                pred_flow=pred_flow,
+                pred_b=pred_b,
+                gt_flow=gt_flow,
+                gt_vis=gt_vis,
+                return_pnp_weights=False,
+            )
         loss_dense = dense_stats["dense_flow_loss"]
         loss_invis = dense_stats["dense_invis_reg"]
 
         lw = self.loss_weights
         total = lw.cls * loss_cls + lw.dense * loss_dense + lw.invis_reg * loss_invis
 
-        self.log("val/loss_total", total, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val/loss_cls", loss_cls, on_step=False, on_epoch=True)
-        self.log("val/loss_dense", loss_dense, on_step=False, on_epoch=True)
-        self.log("val/loss_invis_reg", loss_invis, on_step=False, on_epoch=True)
+        # Lightning automatically aggregates on_epoch=True metrics (mean reduction by default)
+        self.log("val/loss_total", total, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_cls", loss_cls, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_dense", loss_dense, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_invis_reg", loss_invis, on_step=False, on_epoch=True, sync_dist=True)
 
-        self.log("val/acc_overall", cls_stats["acc_overall"], prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val/acc_seen", cls_stats["acc_seen"], on_step=False, on_epoch=True)
-        self.log("val/acc_unseen", cls_stats["acc_unseen"], on_step=False, on_epoch=True)
-        self.log("val/M_pairs", pack["M"].float(), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val/acc_overall", cls_stats["acc_overall"], prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/acc_seen", cls_stats["acc_seen"], on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/acc_unseen", cls_stats["acc_unseen"], on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/M_pairs", pack["M"].float(), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        
+        # BOP Pose Evaluation (if enabled)
+        if self.enable_pose_eval and self.bop_evaluator is not None:
+            try:
+                self._evaluate_poses(batch, outputs, pack, pred_flow, pred_b, batch_idx)
+            except Exception as e:
+                logger.warning(f"Pose evaluation failed for batch {batch_idx}: {e}")
+    
+    def _evaluate_poses(self, batch: Any, outputs: Dict[str, torch.Tensor], 
+                       pack: Dict[str, torch.Tensor], pred_flow: torch.Tensor, 
+                       pred_b: torch.Tensor, batch_idx: int) -> None:
+        """
+        Evaluate poses using BOP metrics (MSPD, MSSD).
+        
+        This method:
+        1. Builds 2D-3D correspondences from packed model outputs (matched patches only)
+        2. Runs RANSAC PnP to estimate poses
+        3. Computes MSPD and MSSD errors
+        4. Adds results to the BOP evaluator
+        
+        Args:
+            batch: VPOGBatch with depth, poses, K
+            outputs: Model outputs (not used directly - we use packed pairs)
+            pack: Packed indices from pack_valid_qt_pairs
+            pred_flow: Dense flow predictions [M, ps, ps, 2]
+            pred_b: Laplace scale [M, ps, ps]
+            batch_idx: Batch index for logging
+        """
+        import numpy as np
+        import cv2
+        
+        # Get batch metadata
+        B = batch.images.shape[0]
+        
+        # Process each query in the batch
+        for b in range(B):
+            try:
+                # Extract metadata from batch.infos (pandas DataFrame)
+                obj_id = int(batch.infos.label.iloc[b])
+                scene_id = int(batch.infos.scene_id.iloc[b])
+                im_id = int(batch.infos.view_id.iloc[b])
+                
+                # Get ground truth pose and camera intrinsics
+                query_pose_gt = batch.poses[b, 0].cpu().numpy()  # [4, 4] - query is first image
+                R_gt = query_pose_gt[:3, :3]
+                t_gt = query_pose_gt[:3, 3] * 1000.0  # Convert to mm for BOP
+                
+                # Build 2D-3D correspondences from packed pairs (matched patches only)
+                corr_2d, corr_3d, weights = self._build_correspondences_from_packed(
+                    batch, pack, pred_flow, pred_b, b
+                )
+                
+                if len(corr_2d) < 4:
+                    logger.debug(f"Batch {batch_idx}, sample {b}: Not enough correspondences ({len(corr_2d)})")
+                    continue
+                
+                # Run RANSAC PnP to estimate pose
+                R_est, t_est, num_inliers = self._solve_pnp_ransac(
+                    corr_2d, corr_3d, K, weights
+                )
+                
+                if num_inliers < 4:
+                    logger.debug(f"Batch {batch_idx}, sample {b}: Not enough inliers ({num_inliers})")
+                    continue
+                
+                # Convert translation to mm for BOP
+                t_est = t_est * 1000.0
+                
+                # Add evaluation to BOP evaluator
+                inlier_ratio = num_inliers / len(corr_2d) if len(corr_2d) > 0 else 0.0
+                self.bop_evaluator.add_evaluation(
+                    R_est=R_est,
+                    t_est=t_est,
+                    R_gt=R_gt,
+                    t_gt=t_gt,
+                    K=batch.K[b].cpu().numpy(),
+                    obj_id=obj_id,
+                    scene_id=scene_id,
+                    im_id=im_id,
+                    score=inlier_ratio,
+                )
+                
+            except Exception as e:
+                logger.debug(f"Failed to evaluate pose for batch {batch_idx}, sample {b}: {e}")
+                continue
+    
+    def _build_correspondences_from_packed(
+        self, 
+        batch: Any, 
+        pack: Dict[str, torch.Tensor],
+        pred_flow: torch.Tensor,  # [M, ps, ps, 2]
+        pred_b: torch.Tensor,     # [M, ps, ps]
+        b_idx: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build 2D-3D correspondences from PACKED pairs (matched patches only).
+        
+        This is the correct approach: we only build correspondences for patches that 
+        have valid buddy matches (predicted by classification head).
+        
+        Args:
+            batch: VPOGBatch with template depth and poses
+            pack: Packed indices from pack_valid_qt_pairs (b_idx, s_idx, q_idx, t_idx, M)
+            pred_flow: Dense flow predictions [M, ps, ps, 2]
+            pred_b: Laplace scale (uncertainty) [M, ps, ps]
+            b_idx: Batch index for this sample
+            K: Camera intrinsics [3, 3]
+            
+        Returns:
+            corr_2d: [N, 2] 2D points in query image (u, v)
+            corr_3d: [N, 3] 3D points in model frame (x, y, z)
+            weights: [N] correspondence confidence weights
+        """
+        try:
+            device = pred_flow.device
+            ps = pred_flow.shape[1]
+            img_size = 224
+            patch_size = 16
+            grid_size = img_size // patch_size  # 14
+            
+            # Filter packed pairs for this batch sample
+            mask = pack["b_idx"] == b_idx
+            if mask.sum() == 0:
+                logger.debug(f"No matched pairs for sample {b_idx}")
+                return np.array([]).reshape(0, 2), np.array([]).reshape(0, 3), np.array([])
+            
+            # Extract this sample's packed data
+            s_idx = pack["s_idx"][mask]      # [M_sample] which template
+            q_idx = pack["q_idx"][mask]      # [M_sample] which query patch
+            t_idx = pack["t_idx"][mask]      # [M_sample] which template patch (buddy)
+            flow = pred_flow[mask]           # [M_sample, ps, ps, 2]
+            b_scale = pred_b[mask]           # [M_sample, ps, ps]
+            
+            M_sample = len(q_idx)
+            
+            # Check if batch has required data
+            if not hasattr(batch, 'template_depth') or batch.template_depth is None:
+                logger.debug(f"No template depth available for sample {b_idx}")
+                return np.array([]).reshape(0, 2), np.array([]).reshape(0, 3), np.array([])
+            
+            # Convert patch indices to grid coordinates
+            def patch_idx_to_coords(idx):
+                """Convert flat patch index to (y, x) grid coordinates."""
+                y = idx // grid_size
+                x = idx % grid_size
+                return y, x
+            
+            qy, qx = patch_idx_to_coords(q_idx)  # [M_sample]
+            ty, tx = patch_idx_to_coords(t_idx)  # [M_sample]
+            
+            # Build dense pixel grids within each patch
+            delta_coords = torch.arange(ps, device=device)  # [ps]
+            delta_v, delta_u = torch.meshgrid(delta_coords, delta_coords, indexing='ij')  # [ps, ps]
+            delta_uv = torch.stack([delta_u, delta_v], dim=-1).float()  # [ps, ps, 2]
+            
+            # Query 2D pixels: [M_sample, ps, ps, 2]
+            query_base_x = qx[:, None, None].float() * patch_size  # [M_sample, 1, 1]
+            query_base_y = qy[:, None, None].float() * patch_size  # [M_sample, 1, 1]
+            query_base = torch.stack([query_base_x, query_base_y], dim=-1)  # [M_sample, 1, 1, 2]
+            query_pixels = query_base + delta_uv[None, :, :, :]  # [M_sample, ps, ps, 2]
+            
+            # Template baseline pixels (before flow): [M_sample, ps, ps, 2]
+            template_base_x = tx[:, None, None].float() * patch_size
+            template_base_y = ty[:, None, None].float() * patch_size
+            template_base = torch.stack([template_base_x, template_base_y], dim=-1)
+            template_baseline = template_base + delta_uv[None, :, :, :]
+            
+            # Apply dense flow: template_pixels = baseline + flow * patch_size
+            template_pixels = template_baseline + flow * patch_size  # [M_sample, ps, ps, 2]
+            
+            # Check bounds
+            valid_bounds = (
+                (template_pixels[..., 0] >= 0) & (template_pixels[..., 0] < img_size) &
+                (template_pixels[..., 1] >= 0) & (template_pixels[..., 1] < img_size)
+            )  # [M_sample, ps, ps]
+            
+            # Sample depth from template images
+            # For each correspondence, we need to know which template image to sample from
+            # Build list of correspondences with their template indices
+            corr_2d_list = []
+            corr_3d_list = []
+            weights_list = []
+            
+            for i in range(M_sample):
+                s = s_idx[i].item()  # template index
+                
+                # Get template data for this specific template
+                template_depth_map = batch.template_depth[b_idx, s]  # [H, W]
+                template_pose = batch.poses[b_idx, s + 1]  # [4, 4] (+1 because first pose is query)
+                K_template = batch.K[b_idx, s + 1]  # [3, 3]
+                
+                # Sample depth at template pixels
+                t_pixels = template_pixels[i]  # [ps, ps, 2]
+                t_u = t_pixels[..., 0]  # [ps, ps]
+                t_v = t_pixels[..., 1]  # [ps, ps]
+                
+                # Bilinear sampling (simple version - could use grid_sample)
+                t_u_floor = t_u.long().clamp(0, img_size - 2)
+                t_v_floor = t_v.long().clamp(0, img_size - 2)
+                depth_vals = template_depth_map[t_v_floor, t_u_floor]  # [ps, ps]
+                
+                # Check valid depth
+                valid_depth = (depth_vals > 0.01) & (depth_vals < 10.0)  # meters
+                valid_mask = valid_bounds[i] & valid_depth  # [ps, ps]
+                
+                if valid_mask.sum() == 0:
+                    continue
+                
+                # Backproject template pixels to 3D in template camera frame
+                fx, fy = K_template[0, 0].item(), K_template[1, 1].item()
+                cx, cy = K_template[0, 2].item(), K_template[1, 2].item()
+                
+                X = (t_u - cx) * depth_vals / fx  # [ps, ps]
+                Y = (t_v - cy) * depth_vals / fy  # [ps, ps]
+                Z = depth_vals                     # [ps, ps]
+                pts_3d_cam = torch.stack([X, Y, Z], dim=-1)  # [ps, ps, 3]
+                
+                # Transform to model frame: T_m2c^-1 @ [X, Y, Z, 1]
+                T_inv = torch.inverse(template_pose)  # [4, 4]
+                R_inv = T_inv[:3, :3]  # [3, 3]
+                t_inv = T_inv[:3, 3]   # [3]
+                
+                pts_3d_model = torch.matmul(pts_3d_cam, R_inv.T) + t_inv  # [ps, ps, 3]
+                
+                # Compute weights: 1 / (b + eps)
+                conf_weights = 1.0 / (b_scale[i] + 1e-4)  # [ps, ps]
+                
+                # Flatten and filter valid
+                q_pix_flat = query_pixels[i].reshape(-1, 2)[valid_mask.flatten()]  # [N_valid, 2]
+                pts_3d_flat = pts_3d_model.reshape(-1, 3)[valid_mask.flatten()]    # [N_valid, 3]
+                weights_flat = conf_weights.flatten()[valid_mask.flatten()]        # [N_valid]
+                
+                corr_2d_list.append(q_pix_flat)
+                corr_3d_list.append(pts_3d_flat)
+                weights_list.append(weights_flat)
+            
+            if len(corr_2d_list) == 0:
+                logger.debug(f"No valid correspondences after depth filtering for sample {b_idx}")
+                return np.array([]).reshape(0, 2), np.array([]).reshape(0, 3), np.array([])
+            
+            # Concatenate all correspondences
+            corr_2d = torch.cat(corr_2d_list, dim=0).cpu().numpy()  # [N, 2]
+            corr_3d = torch.cat(corr_3d_list, dim=0).cpu().numpy()  # [N, 3]
+            weights = torch.cat(weights_list, dim=0).cpu().numpy()  # [N]
+            
+            logger.debug(f"Built {len(corr_2d)} correspondences from {M_sample} packed pairs for sample {b_idx}")
+            return corr_2d, corr_3d, weights
+            
+        except Exception as e:
+            logger.debug(f"Correspondence building failed for sample {b_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            return np.array([]).reshape(0, 2), np.array([]).reshape(0, 3), np.array([])
+    
+    def _solve_pnp_ransac(
+        self,
+        pts_2d: np.ndarray,
+        pts_3d: np.ndarray,
+        K: np.ndarray,
+        weights: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """
+        Solve PnP with RANSAC.
+        
+        Returns:
+            R: [3, 3] rotation matrix
+            t: [3] translation vector (meters)
+            num_inliers: Number of inliers
+        """
+        if len(pts_2d) < 4:
+            return np.eye(3), np.zeros(3), 0
+        
+        # RANSAC parameters
+        ransac_threshold = 8.0  # pixels
+        ransac_iterations = 1000
+        ransac_confidence = 0.99
+        
+        # Reshape for OpenCV
+        pts_2d_cv = pts_2d.astype(np.float32).reshape(-1, 1, 2)
+        pts_3d_cv = pts_3d.astype(np.float32).reshape(-1, 1, 3)
+        camera_matrix = K.astype(np.float32)
+        dist_coeffs = np.zeros(4, dtype=np.float32)
+        
+        try:
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                objectPoints=pts_3d_cv,
+                imagePoints=pts_2d_cv,
+                cameraMatrix=camera_matrix,
+                distCoeffs=dist_coeffs,
+                reprojectionError=ransac_threshold,
+                iterationsCount=ransac_iterations,
+                confidence=ransac_confidence,
+                flags=cv2.SOLVEPNP_EPNP,
+            )
+            
+            if not success or inliers is None:
+                return np.eye(3), np.zeros(3), 0
+            
+            # Convert rotation vector to matrix
+            R, _ = cv2.Rodrigues(rvec)
+            t = tvec.flatten()
+            num_inliers = len(inliers)
+            
+            return R, t, num_inliers
+            
+        except cv2.error:
+            return np.eye(3), np.zeros(3), 0
+    
+    def on_validation_epoch_start(self) -> None:
+        """Reset BOP evaluator at start of validation epoch."""
+        if self.enable_pose_eval and self.bop_evaluator is not None:
+            self.bop_evaluator.reset()
+            logger.info("BOP evaluator reset for new validation epoch")
+    
+    def on_validation_epoch_end(self) -> None:
+        """Compute and log BOP metrics at end of validation epoch."""
+        if self.enable_pose_eval and self.bop_evaluator is not None:
+            try:
+                # Get metrics summary
+                metrics = self.bop_evaluator.get_metrics()
+                
+                # Log main metrics
+                if metrics['num_samples'] > 0:
+                    self.log("val/ar_mspd", metrics['ar_mspd'], prog_bar=True, on_epoch=True)
+                    self.log("val/ar_mssd", metrics['ar_mssd'], prog_bar=True, on_epoch=True)
+                    self.log("val/ar_combined", metrics['ar_combined'], prog_bar=True, on_epoch=True)
+                    self.log("val/mean_mspd_error", metrics['mean_mspd_error'], on_epoch=True)
+                    self.log("val/mean_mssd_error", metrics['mean_mssd_error'], on_epoch=True)
+                    self.log("val/num_pose_samples", float(metrics['num_samples']), on_epoch=True)
+                    
+                    logger.info(
+                        f"Validation BOP Metrics: "
+                        f"AR_MSPD={metrics['ar_mspd']:.3f}, "
+                        f"AR_MSSD={metrics['ar_mssd']:.3f}, "
+                        f"AR_combined={metrics['ar_combined']:.3f}, "
+                        f"N={metrics['num_samples']}"
+                    )
+                else:
+                    logger.warning("No poses successfully estimated during validation epoch")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to compute BOP metrics: {e}")
 
     def configure_optimizers(self):
         use_param_groups = self.hparams.get("use_param_groups", False)

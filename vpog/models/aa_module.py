@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from external.croco.models.pos_embed import RoPE2D
 
@@ -150,11 +151,23 @@ class GlobalJointAttention(nn.Module):
             k[:, :, HW:, :] = k_t.view(B, self.num_heads, S * Nt, self.head_dim)
 
         # attention
-        attn = (q * self.scale) @ k.transpose(-2, -1)  # [B,Hh,N,N]
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # attn = (q * self.scale) @ k.transpose(-2, -1)  # [B,Hh,N,N]
+        # attn = attn.softmax(dim=-1)
+        # attn = self.attn_drop(attn)
 
-        out = attn @ v  # [B,Hh,N,Dh]
+        # out = attn @ v  # [B,Hh,N,Dh]
+
+        # attention (memory-efficient SDPA; avoids explicit [B,Hh,N,N])
+        dropout_p = self.attn_drop.p if self.training else 0.0
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )  # [B,Hh,N,Dh]
+
+
         out = out.transpose(1, 2).contiguous().view(B, N, C)
         out = self.proj_drop(self.proj(out))
 
@@ -244,11 +257,19 @@ class LocalWindowAttention(nn.Module):
         q = torch.cat([q_img, q_sp], dim=2)
         k = torch.cat([k_img, k_sp], dim=2)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # attn = (q * self.scale) @ k.transpose(-2, -1)
+        # attn = attn.softmax(dim=-1)
+        # attn = self.attn_drop(attn)
+        # out = attn @ v
 
-        out = attn @ v
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )  # [Bwin, Hh, Nseq, Dh]
+
         out = out.transpose(1, 2).contiguous().view(Bwin, Nseq, C)
         out = self.proj_drop(self.proj(out))
 

@@ -62,6 +62,10 @@ dense_flow_head:
   use_layernorm: true
   eps_b: 0.0001
 
+# BOP Evaluation Configuration
+enable_pose_eval: true  # Enable/disable pose estimation during validation
+# Note: dataset_name is taken from train.yaml's val_dataset_name
+
 # # Classification head configuration
 # classification_head:
 #   _target_: vpog.models.classification_head.ClassificationHead

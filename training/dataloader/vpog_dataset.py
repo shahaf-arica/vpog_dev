@@ -67,7 +67,10 @@ class VPOGBatch:
     #  H_p*W_p               → object patch but unseen
     patch_cls: torch.Tensor              # [B, S, H_p, W_p]
 
-    # NEW: dense flow and weights (template→query, in query-patch coords)
+    # NEW: dense flow and visibility (template→query, in query-patch coords)
+    # STORAGE DESIGN (Design B): Indexed by QUERY patch position
+    #   dense_flow[b, s, i_q, j_q] = flow from buddy_template(b,s,i_q,j_q) → query_patch[i_q,j_q]
+    #   Training must gather by q_idx (query patch index), NOT t_idx (template index)
     dense_flow: torch.Tensor             # [B, S, H_p, W_p, ps, ps, 2]
     dense_visibility: torch.Tensor           # [B, S, H_p, W_p, ps, ps]
 
@@ -78,6 +81,8 @@ class VPOGBatch:
     bboxes: Optional[torch.Tensor] = None          # [B, 4]
     query_depth: Optional[torch.Tensor] = None     # [B, 224, 224]
     template_depth: Optional[torch.Tensor] = None  # [B, S, 224, 224]
+    M_query: Optional[torch.Tensor] = None         # [B, 3, 3] Crop transformation (orig→cropped)
+    K_original_query: Optional[torch.Tensor] = None  # [B, 3, 3] Original intrinsics before crop
 
     def to(self, device: torch.device) -> "VPOGBatch":
         """Move all tensors to the specified device and return a new VPOGBatch."""
@@ -96,11 +101,13 @@ class VPOGBatch:
             dense_flow=self.dense_flow.to(device),
             dense_visibility=self.dense_visibility.to(device),
             infos=self.infos,
-            full_rgb=self.full_rgb if self.full_rgb is not None else None,
-            centered_rgb=self.centered_rgb if self.centered_rgb is not None else None,
-            bboxes=self.bboxes if self.bboxes is not None else None,
-            query_depth=self.query_depth if self.query_depth is not None else None,
-            template_depth=self.template_depth if self.template_depth is not None else None,
+            full_rgb=self.full_rgb.to(device) if self.full_rgb is not None else None,
+            centered_rgb=self.centered_rgb.to(device) if self.centered_rgb is not None else None,
+            bboxes=self.bboxes.to(device) if self.bboxes is not None else None,
+            query_depth=self.query_depth.to(device) if self.query_depth is not None else None,
+            template_depth=self.template_depth.to(device) if self.template_depth is not None else None,
+            M_query=self.M_query.to(device) if self.M_query is not None else None,
+            K_original_query=self.K_original_query.to(device) if self.K_original_query is not None else None,
         )
 
 
@@ -140,6 +147,7 @@ class VPOGDataset:
         depth_scale: float = 10.0,
         depth_tolerance: float = 5.0,
         seed: Optional[int] = None,
+        subsample_dataset: int = -1,
         **kwargs,
     ):
         """
@@ -226,6 +234,13 @@ class VPOGDataset:
             )
         
         object_index = load_object_index(object_index_path)
+
+        if subsample_dataset > 0:
+            # Subsample object index for quicker testing
+            original_size = len(object_index)
+            object_index = object_index[:subsample_dataset]
+            logger.info(f"  Subsampled object index: {original_size} → {len(object_index)} objects")
+
         self.web_dataloader = ObjectLevelDataset(web_dataset, object_index)
         self.size = len(object_index)
         
@@ -239,19 +254,15 @@ class VPOGDataset:
             model_infos = [{"obj_id": int(obj_id)} for obj_id in model_infos_bop.keys()]
         template_config['dir'] = f"{template_config['dir']}/{dataset_name}"
         
-        # # Create config object with required attributes
-        # # TemplateDataset.from_config expects: dir, pose_name, num_templates, scale_factor
-        # config_obj = type('Config', (), {
-        #     'dir': template_config['dir'],
-        #     'pose_name': template_config.get('pose_name', 'object_poses/OBJECT_ID.npy'),
-        #     'num_templates': template_config.get('num_templates', 162),
-        #     'scale_factor': template_config.get('scale_factor', 10.0),
-        #     'level_templates': template_config.get('level_templates', 1),
-        #     'pose_distribution': template_config.get('pose_distribution', 'all'),
-        # })()
+        # Convert template_config dict to object with attributes for TemplateDataset.from_config
+        from types import SimpleNamespace
+        if isinstance(template_config, dict):
+            template_config_obj = SimpleNamespace(**template_config)
+        else:
+            template_config_obj = template_config
         
         self.template_dataset = TemplateDataset.from_config(
-            model_infos, template_config
+            model_infos, template_config_obj
         )
 
         self.cad_scale_factor = template_config.get('scale_factor', 10.0)
@@ -281,15 +292,6 @@ class VPOGDataset:
         
         # Initialize flow computer
         flow_config = flow_config or {}
-        # self.flow_computer = FlowComputer(
-        #     patch_size=patch_size,
-        #     compute_visibility=flow_config.get('compute_visibility', True),
-        #     compute_patch_visibility=flow_config.get('compute_patch_visibility', True),
-        #     visibility_threshold=flow_config.get('visibility_threshold', 0.1),
-        # )
-        
-        # logger.info(f"  Flow computation: visibility={self.flow_computer.compute_visibility}, "
-        #            f"patch_visibility={self.flow_computer.compute_patch_visibility}")
         
         # Setup transforms
         self._setup_transforms()
@@ -501,89 +503,105 @@ class VPOGDataset:
             # Load template object first
             template_object = self.template_dataset.get_object_templates(label)
             
-            # STEP 1: Find nearest OOP (out-of-plane) template t* using GigaPose's method
-            # This finds the template with the same viewing direction, ignoring in-plane rotation
-            from src.custom_megapose.template_dataset import NearestTemplateFinder
-            
-            config_obj = type('Config', (), {
-                'level_templates': self.template_selector.level_templates,
-                'pose_distribution': self.template_selector.pose_distribution,
-            })()
-            
-            template_finder = NearestTemplateFinder(config_obj)
-            nearest_info = template_finder.search_nearest_template(query_pose[:3, :3])
-            nearest_template_idx = nearest_info['view_id']
-            
-            # # DEBUG: Log for verification
-            # if label == '733' or (len(template_indices_list) == 0 and logger.level <= 20):
-            #     logger.info(f"  Object {label}: Nearest OOP template t* = {nearest_template_idx}")
-            
-            # STEP 2: Find S_p-1 additional templates that are closest to t* in full SO(3)
-            # These provide small perturbations around t* to reveal more pixels
-            all_template_poses = self.template_selector.template_poses
-            nearest_template_pose = all_template_poses[nearest_template_idx]
-            
-            # Compute SO(3) distances from ALL templates to t*
-            angles_to_nearest = np.zeros(len(all_template_poses))
-            R_nearest = nearest_template_pose[:3, :3]
-            
-            for i, template_pose in enumerate(all_template_poses):
-                R_template = template_pose[:3, :3]
-                R_rel = R_nearest.T @ R_template
-                trace = np.trace(R_rel)
-                cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
-                angles_to_nearest[i] = np.rad2deg(np.arccos(cos_angle))
-            
-            # Sort by distance to t* and select S_p-1 nearest (excluding t* itself)
-            sorted_indices = np.argsort(angles_to_nearest)
-            positive_indices = [nearest_template_idx]  # t* is first
-            for idx in sorted_indices[1:]:  # Skip index 0 which is t* itself
-                if len(positive_indices) >= self.template_selector.num_positive:
-                    break
-                if int(idx) != nearest_template_idx:  # Double check we're not adding t* again
-                    positive_indices.append(int(idx))
-            
-            # STEP 3: Select negative templates (far from query in OOP)
-            # Compute angles from query to all templates
-            angles_to_query = np.zeros(len(all_template_poses))
-            R_query = query_pose[:3, :3]
-            for i, template_pose in enumerate(all_template_poses):
-                R_template = template_pose[:3, :3]
-                R_rel = R_query.T @ R_template
-                trace = np.trace(R_rel)
-                cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
-                angles_to_query[i] = np.rad2deg(np.arccos(cos_angle))
-            
-            negative_candidates = np.where(angles_to_query >= self.template_selector.min_negative_angle_deg)[0]
-            if len(negative_candidates) < self.template_selector.num_negative:
-                sorted_by_distance = np.argsort(-angles_to_query)
-                negative_indices = sorted_by_distance[:self.template_selector.num_negative].tolist()
+            # Validation mode: use all templates sequentially without GT-based selection
+            if self.mode == 'val':
+                all_template_poses = self.template_selector.template_poses
+                all_indices = list(range(len(all_template_poses)))[:self.num_templates]
+                
+                # Extract d_ref from first template (no GT peeking)
+                d_ref_pose = all_template_poses[0]
+                from src.lib3d.numpy import opencv2opengl
+                d_ref_pose_opengl = opencv2opengl(d_ref_pose)
+                d_ref = d_ref_pose_opengl[:3, 2]
+                d_ref = d_ref / np.linalg.norm(d_ref)
+                
+                positive_indices = all_indices
+                negative_indices = []
             else:
-                sampled = self.template_selector.rng.choice(
-                    negative_candidates, size=self.template_selector.num_negative, replace=False
-                )
-                negative_indices = sampled.tolist()
-            
-            # Build selection result
-            selection = {
-                'nearest_template_idx': nearest_template_idx,
-                'positive_indices': positive_indices,
-                'negative_indices': negative_indices,
-                'all_indices': positive_indices + negative_indices,
-            }
-            
-            # Extract d_ref from t*
-            d_ref_pose = all_template_poses[nearest_template_idx]
-            from src.lib3d.numpy import opencv2opengl
-            d_ref_pose_opengl = opencv2opengl(d_ref_pose)
-            d_ref = d_ref_pose_opengl[:3, 2]
-            d_ref = d_ref / np.linalg.norm(d_ref)
-            selection['d_ref'] = d_ref
-            
-            positive_indices = selection['positive_indices']
-            negative_indices = selection['negative_indices']
-            all_indices = selection['all_indices']
-            d_ref = selection['d_ref']
+                # Training mode: GT-based template selection
+                # STEP 1: Find nearest OOP (out-of-plane) template t* using GigaPose's method
+                # This finds the template with the same viewing direction, ignoring in-plane rotation
+                from src.custom_megapose.template_dataset import NearestTemplateFinder
+                
+                config_obj = type('Config', (), {
+                    'level_templates': self.template_selector.level_templates,
+                    'pose_distribution': self.template_selector.pose_distribution,
+                })()
+                
+                template_finder = NearestTemplateFinder(config_obj)
+                nearest_info = template_finder.search_nearest_template(query_pose[:3, :3])
+                nearest_template_idx = nearest_info['view_id']
+                
+                # # DEBUG: Log for verification
+                # if label == '733' or (len(template_indices_list) == 0 and logger.level <= 20):
+                #     logger.info(f"  Object {label}: Nearest OOP template t* = {nearest_template_idx}")
+                
+                # STEP 2: Find S_p-1 additional templates that are closest to t* in full SO(3)
+                # These provide small perturbations around t* to reveal more pixels
+                all_template_poses = self.template_selector.template_poses
+                nearest_template_pose = all_template_poses[nearest_template_idx]
+                
+                # Compute SO(3) distances from ALL templates to t*
+                angles_to_nearest = np.zeros(len(all_template_poses))
+                R_nearest = nearest_template_pose[:3, :3]
+                
+                for i, template_pose in enumerate(all_template_poses):
+                    R_template = template_pose[:3, :3]
+                    R_rel = R_nearest.T @ R_template
+                    trace = np.trace(R_rel)
+                    cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+                    angles_to_nearest[i] = np.rad2deg(np.arccos(cos_angle))
+                
+                # Sort by distance to t* and select S_p-1 nearest (excluding t* itself)
+                sorted_indices = np.argsort(angles_to_nearest)
+                positive_indices = [nearest_template_idx]  # t* is first
+                for idx in sorted_indices[1:]:  # Skip index 0 which is t* itself
+                    if len(positive_indices) >= self.template_selector.num_positive:
+                        break
+                    if int(idx) != nearest_template_idx:  # Double check we're not adding t* again
+                        positive_indices.append(int(idx))
+                
+                # STEP 3: Select negative templates (far from query in OOP)
+                # Compute angles from query to all templates
+                angles_to_query = np.zeros(len(all_template_poses))
+                R_query = query_pose[:3, :3]
+                for i, template_pose in enumerate(all_template_poses):
+                    R_template = template_pose[:3, :3]
+                    R_rel = R_query.T @ R_template
+                    trace = np.trace(R_rel)
+                    cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+                    angles_to_query[i] = np.rad2deg(np.arccos(cos_angle))
+                
+                negative_candidates = np.where(angles_to_query >= self.template_selector.min_negative_angle_deg)[0]
+                if len(negative_candidates) < self.template_selector.num_negative:
+                    sorted_by_distance = np.argsort(-angles_to_query)
+                    negative_indices = sorted_by_distance[:self.template_selector.num_negative].tolist()
+                else:
+                    sampled = self.template_selector.rng.choice(
+                        negative_candidates, size=self.template_selector.num_negative, replace=False
+                    )
+                    negative_indices = sampled.tolist()
+                
+                # Build selection result
+                selection = {
+                    'nearest_template_idx': nearest_template_idx,
+                    'positive_indices': positive_indices,
+                    'negative_indices': negative_indices,
+                    'all_indices': positive_indices + negative_indices,
+                }
+                
+                # Extract d_ref from t*
+                d_ref_pose = all_template_poses[nearest_template_idx]
+                from src.lib3d.numpy import opencv2opengl
+                d_ref_pose_opengl = opencv2opengl(d_ref_pose)
+                d_ref = d_ref_pose_opengl[:3, 2]
+                d_ref = d_ref / np.linalg.norm(d_ref)
+                selection['d_ref'] = d_ref
+                
+                positive_indices = selection['positive_indices']
+                negative_indices = selection['negative_indices']
+                all_indices = selection['all_indices']
+                d_ref = selection['d_ref']
             
             # Load each selected template
             batch_template_data = {
@@ -814,857 +832,7 @@ class VPOGDataset:
         valid = (z > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
         
         return u, v, z, valid
-    
-    def compute_flow_labels_for_train(
-        self,
-        query_data: tc.PandasTensorCollection,
-        template_data: tc.PandasTensorCollection,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute training labels between query and templates using CROPPED 224x224 depth/K.
-
-        Outputs:
-            - flows        : [B, S, H_p, W_p, 2]  (coarse query→template flow, patch centers)
-            - visibility   : [B, S, H_p, W_p]     (patch is visible in template)
-        """
-        import matplotlib.pyplot as plt
         
-        # Get metadata
-        obj_label = query_data.infos.label[batch_idx]
-        H_orig, W_orig = q_depth_orig.shape
-        H_t_orig, W_t_orig = t_depth_orig.shape
-        
-        # Pose info
-        q_pose_np = q_pose.cpu().numpy()
-        t_pose_np = t_pose.cpu().numpy()
-        
-        logger.info(f"  Visualizing object {obj_label}:")
-        logger.info(f"    Query pose t: {q_pose_np[:3, 3]}")
-        logger.info(f"    Template pose t: {t_pose_np[:3, 3]}")
-        
-        # ===== COMPUTE VALIDATION DEPTHS (GOOD METHOD) =====
-        query_depth_render = None
-        template_depth_render = None
-        
-        try:
-            # Extract query point cloud and transform to world
-            valid_mask = (q_depth_orig > 0) & (q_mask_orig > 0.5)
-            pcd_query_cam = points_q_cam[valid_mask].cpu().numpy()  # [N, 3]
-            
-            T_cam2world = np.linalg.inv(q_pose_np)
-            pcd_homo = np.concatenate([pcd_query_cam, np.ones((len(pcd_query_cam), 1))], axis=1)
-            pcd_world = (T_cam2world @ pcd_homo.T).T[:, :3]  # [N, 3] in BOP scale (mm)
-            
-            # Project to query (should match PNG)
-            query_depth_render = self._project_pcd_helper(
-                pcd_world, q_pose_np, q_K_orig.cpu().numpy(), H_orig, W_orig
-            )
-            
-            # Project to template with cad_scale_factorx scaling 
-            template_depth_render = self._project_pcd_helper(
-                pcd_world * self.cad_scale_factor, t_pose_np, t_K_orig.cpu().numpy(), H_t_orig, W_t_orig
-            )
-            
-        except Exception as e:
-            logger.warning(f"  Mesh projection failed: {e}")
-        
-        # ===== CREATE VISUALIZATION =====
-        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-        
-        # ROW 0: RGB
-        q_rgb = query_data.full_rgb[batch_idx].cpu().permute(1, 2, 0).numpy()
-        q_mask_np = q_mask_orig.cpu().numpy()
-        
-        axes[0, 0].imshow(q_rgb)
-        axes[0, 0].set_title(f'Query RGB\n{H_orig}x{W_orig}', fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        q_rgb_masked = q_rgb * q_mask_np[:, :, None]
-        axes[0, 1].imshow(q_rgb_masked)
-        axes[0, 1].set_title(f'Query Masked\nObj {obj_label}', fontweight='bold')
-        axes[0, 1].axis('off')
-        
-        # Show correspondence count
-        if correspondences:
-            axes[0, 2].text(0.5, 0.5, f"{correspondences['count']} correspondences\n\n"
-                           f"Query: [{correspondences['query_z'].min():.0f}, {correspondences['query_z'].max():.0f}] mm\n"
-                           f"Template: [{correspondences['template_z'].min():.0f}, {correspondences['template_z'].max():.0f}] units",
-                           ha='center', va='center', fontsize=12, fontweight='bold')
-        else:
-            axes[0, 2].text(0.5, 0.5, 'NO CORRESPONDENCES', ha='center', va='center', 
-                           fontsize=14, color='red', fontweight='bold')
-        axes[0, 2].axis('off')
-        axes[0, 3].axis('off')
-        
-        # ROW 1: Depth comparison (PNG vs Rendered)
-        q_depth_np = (q_depth_orig * q_mask_orig).cpu().numpy()
-        t_depth_np = t_depth_orig.cpu().numpy()
-        
-        # Query depth PNG
-        im1 = axes[1, 0].imshow(q_depth_np, cmap='jet', vmin=0, 
-                                 vmax=q_depth_np[q_depth_np>0].max() if (q_depth_np>0).any() else 1)
-        axes[1, 0].set_title(f'Query Depth (PNG)\n[{q_depth_np[q_depth_np>0].min():.0f}, {q_depth_np[q_depth_np>0].max():.0f}] mm',
-                            fontweight='bold')
-        axes[1, 0].axis('off')
-        plt.colorbar(im1, ax=axes[1, 0], fraction=0.046)
-        
-        # Query rendered (should match PNG)
-        if query_depth_render is not None and (query_depth_render > 0).any():
-            im2 = axes[1, 1].imshow(query_depth_render, cmap='jet', vmin=0, 
-                                     vmax=query_depth_render[query_depth_render>0].max())
-            axes[1, 1].set_title(f'Query Rendered (VALIDATION)\n[{query_depth_render[query_depth_render>0].min():.0f}, {query_depth_render[query_depth_render>0].max():.0f}] mm',
-                                fontweight='bold', color='green')
-            plt.colorbar(im2, ax=axes[1, 1], fraction=0.046)
-        axes[1, 1].axis('off')
-        
-        # Template depth PNG (CORRECT)
-        im3 = axes[1, 2].imshow(t_depth_np, cmap='jet', vmin=0, vmax=t_depth_np.max())
-        axes[1, 2].set_title(f'Template Depth (PNG - CORRECT)\n[{t_depth_np[t_depth_np>0].min():.0f}, {t_depth_np[t_depth_np>0].max():.0f}] units',
-                            fontweight='bold', color='green')
-        axes[1, 2].axis('off')
-        plt.colorbar(im3, ax=axes[1, 2], fraction=0.046)
-        
-        # Template rendered (CORRECT - should match PNG)
-        if template_depth_render is not None and (template_depth_render > 0).any():
-            im4 = axes[1, 3].imshow(template_depth_render, cmap='jet', vmin=0,
-                                     vmax=template_depth_render[template_depth_render>0].max())
-            axes[1, 3].set_title(f'Template Rendered (CORRECT)\n[{template_depth_render[template_depth_render>0].min():.0f}, {template_depth_render[template_depth_render>0].max():.0f}] units',
-                                fontweight='bold', color='green')
-            plt.colorbar(im4, ax=axes[1, 3], fraction=0.046)
-        axes[1, 3].axis('off')
-        
-        # Title
-        plt.suptitle(f'Object {obj_label}: Query-Template Correspondence Visualization\n'
-                    f'Query Pose: {q_pose_np[:3, 3].astype(int)} mm | Template Pose: {t_pose_np[:3, 3].astype(int)} mm\n'
-                    f'CORRECT Logic: template_depth_render matches template PNG!',
-                    fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        
-        # Save
-        Path(self.vis_dir).mkdir(parents=True, exist_ok=True)
-        save_path = Path(f"{self.vis_dir}/correspondences_b{batch_idx}_s{template_idx}.png")
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        logger.info(f"  ✓ Saved visualization to {save_path}")
-    
-    def _visualize_dense_patch_flow(
-        self,
-        query_rgb: torch.Tensor,          # [3, H, W]
-        template_rgb: torch.Tensor,       # [3, H, W]
-        q_mask: torch.Tensor,             # [H, W]
-        t_depth: torch.Tensor,            # [H, W]
-        flow_grid: torch.Tensor,          # [H_p, W_p, ps, ps, 2]
-        weight_grid: torch.Tensor,        # [H_p, W_p, ps, ps]
-        patch_has_object: torch.Tensor,   # [H_p, W_p]
-        patch_is_visible: torch.Tensor,   # [H_p, W_p]
-        patch_buddy_i: torch.Tensor,      # [H_p, W_p]
-        patch_buddy_j: torch.Tensor,      # [H_p, W_p]
-        batch_idx: int,
-        template_idx: int,
-        obj_label: int,
-    ):
-        """
-        Visualize dense template→query correspondences:
-        - Shows template patch and query patch side by side
-        - Draws lines between corresponding pixels (template → query)
-        - Colors correspond to different pixels for clarity
-        - Red marks indicate pixels with no correspondence
-        """
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        import numpy as np
-        from matplotlib.collections import LineCollection
-        
-        ps = self.patch_size
-        H_p = self.num_patches_per_side
-        
-        # Find visible patches (using the first logic)
-        visible_indices = torch.nonzero(patch_is_visible, as_tuple=False)
-        if visible_indices.numel() == 0:
-            logger.info(f"  [DENSE VIZ] No visible patches to visualize")
-            return
-        
-        # Select up to 4 patches for visualization
-        num_patches = min(4, len(visible_indices))
-        selected_indices = visible_indices[:num_patches]
-        
-        # Convert images to numpy
-        q_rgb_np = query_rgb.cpu().permute(1, 2, 0).numpy()
-        q_rgb_np = np.clip(q_rgb_np, 0, 1)
-        t_rgb_np = template_rgb.cpu().permute(1, 2, 0).numpy()
-        t_rgb_np = np.clip(t_rgb_np, 0, 1)
-        t_depth_np = t_depth.cpu().numpy()
-        
-        # Create figure with full images on top
-        fig = plt.figure(figsize=(15, 4 + 4 * num_patches))
-        
-        # Top row: Full query and template images with patch boxes
-        ax_query_full = plt.subplot2grid((num_patches + 1, 3), (0, 0), colspan=1)
-        ax_query_full.imshow(q_rgb_np)
-        ax_query_full.set_title('Query Image (with selected patches)', fontsize=11, fontweight='bold')
-        ax_query_full.axis('off')
-        
-        ax_template_full = plt.subplot2grid((num_patches + 1, 3), (0, 1), colspan=1)
-        ax_template_full.imshow(t_rgb_np)
-        ax_template_full.set_title('Template Image (with buddy patches)', fontsize=11, fontweight='bold')
-        ax_template_full.axis('off')
-        
-        # Draw boxes on full images for selected patches
-        for idx in range(num_patches):
-            i_q, j_q = selected_indices[idx].tolist()
-            i_t = patch_buddy_i[i_q, j_q].item()
-            j_t = patch_buddy_j[i_q, j_q].item()
-            
-            # Query patch box
-            q_rect = mpatches.Rectangle(
-                (j_q * ps, i_q * ps), ps, ps,
-                linewidth=2, edgecolor='red', facecolor='none'
-            )
-            ax_query_full.add_patch(q_rect)
-            ax_query_full.text(
-                j_q * ps + ps // 2, i_q * ps - 3,
-                f'{idx+1}', color='red', fontsize=11, fontweight='bold',
-                ha='center', va='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-            )
-            
-            # Template buddy patch box
-            t_rect = mpatches.Rectangle(
-                (j_t * ps, i_t * ps), ps, ps,
-                linewidth=2, edgecolor='blue', facecolor='none'
-            )
-            ax_template_full.add_patch(t_rect)
-            ax_template_full.text(
-                j_t * ps + ps // 2, i_t * ps - 3,
-                f'{idx+1}', color='blue', fontsize=11, fontweight='bold',
-                ha='center', va='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-            )
-        
-        # Info panel in top right
-        ax_info = plt.subplot2grid((num_patches + 1, 3), (0, 2), colspan=1)
-        info_text = (
-            f'Dense Flow Visualization\n'
-            f'═══════════════════════\n\n'
-            f'Direction: Template → Query\n'
-            f'Coordinate System:\n'
-            f'  Query patch center = (0, 0)\n'
-            f'  Flow normalized by patch size\n\n'
-            f'Patches shown: {num_patches}\n'
-            f'Patch size: {ps}×{ps} pixels\n\n'
-            f'Red boxes: Query patches\n'
-            f'Blue boxes: Template buddies\n\n'
-            f'In correspondence views:\n'
-            f'  Blue dots: Template pixels\n'
-            f'  Green dots: Query projections\n'
-            f'  Red X: No correspondence'
-        )
-        ax_info.text(0.5, 0.5, info_text, ha='center', va='center',
-                    fontsize=9, fontfamily='monospace',
-                    bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
-        ax_info.axis('off')
-        
-        # Create axes for patch details
-        axes = []
-        for idx in range(num_patches):
-            row_axes = []
-            for col in range(3):
-                ax = plt.subplot2grid((num_patches + 1, 3), (idx + 1, col), colspan=1)
-                row_axes.append(ax)
-            axes.append(row_axes)
-        if num_patches == 1:
-            axes = [axes[0]]
-        
-        # Process each selected patch
-        for idx in range(num_patches):
-            i_q, j_q = selected_indices[idx].tolist()
-            i_t = patch_buddy_i[i_q, j_q].item()
-            j_t = patch_buddy_j[i_q, j_q].item()
-            
-            flow_patch = flow_grid[i_q, j_q].cpu().numpy()    # [ps, ps, 2]
-            weight_patch = weight_grid[i_q, j_q].cpu().numpy()  # [ps, ps]
-            
-            # Extract patches
-            # Query patch
-            qy0, qy1 = i_q * ps, (i_q + 1) * ps
-            qx0, qx1 = j_q * ps, (j_q + 1) * ps
-            q_patch = q_rgb_np[qy0:qy1, qx0:qx1]
-            
-            # Template patch
-            ty0, ty1 = i_t * ps, (i_t + 1) * ps
-            tx0, tx1 = j_t * ps, (j_t + 1) * ps
-            t_patch = t_rgb_np[ty0:ty1, tx0:tx1]
-            t_patch_depth = t_depth_np[ty0:ty1, tx0:tx1]
-            t_patch_mask = t_patch_depth > 0
-            
-            # Column 0: Template patch
-            ax_t = axes[idx][0]
-            ax_t.imshow(t_patch)
-            ax_t.set_title(f'#{idx+1} Template Patch [{i_t},{j_t}]', fontsize=11, fontweight='bold')
-            ax_t.axis('off')
-            
-            # Column 1: Query patch
-            ax_q = axes[idx][1]
-            ax_q.imshow(q_patch)
-            ax_q.set_title(f'#{idx+1} Query Patch [{i_q},{j_q}]', fontsize=11, fontweight='bold')
-            ax_q.axis('off')
-            
-            # Column 2: Correspondences (template left, query right)
-            ax_corr = axes[idx][2]
-            
-            # Create side-by-side view
-            combined = np.concatenate([t_patch, q_patch], axis=1)  # [ps, 2*ps, 3]
-            ax_corr.imshow(combined)
-            
-            # Draw correspondences
-            # Build grid of template pixel positions
-            ty_grid, tx_grid = np.meshgrid(np.arange(ps), np.arange(ps), indexing='ij')
-            
-            # For each template pixel, check if it has a correspondence
-            valid = weight_patch > 0.1
-            
-            # Mark template pixels without correspondence in red
-            no_corr_y, no_corr_x = np.where(t_patch_mask & (~valid))
-            ax_corr.scatter(no_corr_x, no_corr_y, c='red', s=5, alpha=0.6, marker='x')
-            
-            if valid.any():
-                # Get valid correspondences
-                ty_valid = ty_grid[valid]
-                tx_valid = tx_grid[valid]
-                
-                # Flow gives offset from query patch center in normalized coords
-                # Convert to pixel coords in query patch
-                flow_u = flow_patch[..., 0][valid] * ps  # [N]
-                flow_v = flow_patch[..., 1][valid] * ps  # [N]
-                
-                # Query projection: patch center + flow
-                qy_proj = ps // 2 + flow_v
-                qx_proj = ps // 2 + flow_u
-                
-                # Draw lines from template (left) to query (right, offset by ps)
-                lines = []
-                colors = []
-                
-                # Use colormap for variety
-                cmap = plt.cm.get_cmap('tab20')
-                num_valid = len(tx_valid)
-                
-                for i in range(num_valid):
-                    # Template point (left side)
-                    t_x, t_y = tx_valid[i], ty_valid[i]
-                    # Query point (right side, offset by ps)
-                    q_x, q_y = qx_proj[i] + ps, qy_proj[i]
-                    
-                    lines.append([(t_x, t_y), (q_x, q_y)])
-                    colors.append(cmap(i % 20))
-                
-                # Draw lines
-                lc = LineCollection(lines, colors=colors, linewidths=0.5, alpha=0.7)
-                ax_corr.add_collection(lc)
-                
-                # Mark endpoints
-                ax_corr.scatter(tx_valid, ty_valid, c='blue', s=10, alpha=0.8, marker='o')
-                ax_corr.scatter(qx_proj + ps, qy_proj, c='green', s=10, alpha=0.8, marker='o')
-            
-            # Draw dividing line
-            ax_corr.axvline(x=ps, color='white', linewidth=2, linestyle='--', alpha=0.7)
-            
-            # Add labels
-            ax_corr.text(ps // 2, -2, 'Template', ha='center', va='bottom', 
-                        fontsize=10, fontweight='bold', color='blue')
-            ax_corr.text(ps + ps // 2, -2, 'Query', ha='center', va='bottom',
-                        fontsize=10, fontweight='bold', color='green')
-            
-            num_corr = valid.sum()
-            num_total = t_patch_mask.sum()
-            ax_corr.set_title(f'Correspondences: {num_corr}/{num_total} pixels\n'
-                            f'(Template→Query, red x = no corr)', 
-                            fontsize=10, fontweight='bold')
-            ax_corr.axis('off')
-        
-        plt.suptitle(
-            f'Dense Template→Query Flow: Object {obj_label}, Batch {batch_idx}, Template {template_idx}\n'
-            f'Flow in query patch coordinates (center=0,0, normalized by patch size)',
-            fontsize=13, fontweight='bold'
-        )
-        
-        Path(self.vis_dir).mkdir(parents=True, exist_ok=True)
-        save_path = f"{self.vis_dir}/dense_flow_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        logger.info(f"  [DENSE VIZ] ✓ Saved dense flow visualization to {save_path}")
-    
-    def _visualize_train_correspondences(
-        self,
-        query_data,
-        template_data,
-        points_q_cam,
-        correspondences,
-        q_pose,
-        t_pose,
-        q_K,
-        t_K,
-        q_depth,
-        t_depth,
-        q_mask,
-        query_seen_map,
-        template_seen_map,
-        template_not_seen_map,
-        patch_has_object,
-        patch_is_visible,
-        patch_flow_x,
-        patch_flow_y,
-        patch_buddy_i,
-        patch_buddy_j,
-        patch_center_mass_u,
-        patch_center_mass_v,
-        batch_idx,
-        template_idx,
-    ):
-        """
-        Visualize correspondences for TRAINING data (224x224 cropped).
-        Uses mesh projection to validate transformation on cropped data.
-        Also shows visibility maps.
-        """
-        import matplotlib.pyplot as plt
-        
-        # Get metadata
-        obj_label = query_data.infos.label[batch_idx]
-        H, W = q_depth.shape  # 224x224
-        
-        # Pose info
-        q_pose_np = q_pose.cpu().numpy()
-        t_pose_np = t_pose.cpu().numpy()
-        
-        logger.info(f"  [TRAIN VIZ] Object {obj_label}:")
-        logger.info(f"    Query pose t: {q_pose_np[:3, 3]}")
-        logger.info(f"    Template pose t: {t_pose_np[:3, 3]}")
-        
-        # ===== COMPUTE VALIDATION DEPTHS (GOOD METHOD) =====
-        query_depth_render = None
-        template_depth_render = None
-        
-        try:
-            # Extract query point cloud and transform to world
-            valid_mask = (q_depth > 0) & (q_mask > 0.5)
-            pcd_query_cam = points_q_cam[valid_mask].cpu().numpy()  # [N, 3]
-            
-            T_cam2world = np.linalg.inv(q_pose_np)
-            pcd_homo = np.concatenate([pcd_query_cam, np.ones((len(pcd_query_cam), 1))], axis=1)
-            pcd_world = (T_cam2world @ pcd_homo.T).T[:, :3]  # [N, 3] in BOP scale (mm)
-            
-            # Project to query (should match cropped PNG)
-            query_depth_render = self._project_pcd_helper(
-                pcd_world, q_pose_np, q_K.cpu().numpy(), H, W
-            )
-            
-            # Project to template with 10x scaling (GOOD METHOD)
-            template_depth_render = self._project_pcd_helper(
-                pcd_world * self.cad_scale_factor, t_pose_np, t_K.cpu().numpy(), H, W
-            )
-            
-        except Exception as e:
-            logger.warning(f"  [TRAIN VIZ] Mesh projection failed: {e}")
-        
-        # ===== CREATE VISUALIZATION =====
-        fig, axes = plt.subplots(3, 4, figsize=(20, 15))
-        
-        # ROW 0: RGB (from centered_rgb)
-        q_rgb = query_data.centered_rgb[batch_idx].cpu().permute(1, 2, 0).numpy()
-        
-        axes[0, 0].imshow(np.clip(q_rgb, 0, 1))
-        axes[0, 0].set_title(f'Query RGB (Centered)\n{H}x{W}', fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        q_mask_np = q_mask.cpu().numpy()
-        q_rgb_masked = q_rgb * q_mask_np[:, :, None]
-        axes[0, 1].imshow(q_rgb_masked)
-        axes[0, 1].set_title(f'Query Masked\nObj {obj_label}', fontweight='bold')
-        axes[0, 1].axis('off')
-        
-        # Template RGB (cropped)
-        t_rgb = template_data.rgb[batch_idx, template_idx].cpu().permute(1, 2, 0).numpy()
-        axes[0, 2].imshow(np.clip(t_rgb, 0, 1))
-        axes[0, 2].set_title(f'Template RGB\n{H}x{W}', fontweight='bold')
-        axes[0, 2].axis('off')
-        
-        # Show correspondence count
-        if correspondences:
-            axes[0, 3].text(0.5, 0.5, f"{correspondences['count']} correspondences\n\n"
-                           f"Query: [{correspondences['query_z'].min():.0f}, {correspondences['query_z'].max():.0f}] mm\n"
-                           f"Template: [{correspondences['template_z'].min():.0f}, {correspondences['template_z'].max():.0f}] units",
-                           ha='center', va='center', fontsize=12, fontweight='bold')
-        else:
-            axes[0, 3].text(0.5, 0.5, 'NO CORRESPONDENCES', ha='center', va='center', 
-                           fontsize=14, color='red', fontweight='bold')
-        axes[0, 3].axis('off')
-        
-        # ROW 1: Depth comparison (PNG vs Rendered) - CROPPED 224x224
-        q_depth_np = (q_depth * q_mask).cpu().numpy()
-        t_depth_np = t_depth.cpu().numpy()
-        
-        # Query depth PNG (cropped)
-        im1 = axes[1, 0].imshow(q_depth_np, cmap='jet', vmin=0, 
-                                 vmax=q_depth_np[q_depth_np>0].max() if (q_depth_np>0).any() else 1)
-        axes[1, 0].set_title(f'Query Depth (PNG 224x224)\n[{q_depth_np[q_depth_np>0].min():.0f}, {q_depth_np[q_depth_np>0].max():.0f}] mm',
-                            fontweight='bold')
-        axes[1, 0].axis('off')
-        plt.colorbar(im1, ax=axes[1, 0], fraction=0.046)
-        
-        # Query rendered (should match PNG)
-        if query_depth_render is not None and (query_depth_render > 0).any():
-            im2 = axes[1, 1].imshow(query_depth_render, cmap='jet', vmin=0, 
-                                     vmax=query_depth_render[query_depth_render>0].max())
-            axes[1, 1].set_title(f'Query Rendered (VALIDATION)\n[{query_depth_render[query_depth_render>0].min():.0f}, {query_depth_render[query_depth_render>0].max():.0f}] mm',
-                                fontweight='bold', color='green')
-            plt.colorbar(im2, ax=axes[1, 1], fraction=0.046)
-        axes[1, 1].axis('off')
-        
-        # Template depth PNG (CORRECT) - cropped
-        im3 = axes[1, 2].imshow(t_depth_np, cmap='jet', vmin=0, vmax=t_depth_np.max())
-        axes[1, 2].set_title(f'Template Depth (PNG 224x224 - CORRECT)\n[{t_depth_np[t_depth_np>0].min():.0f}, {t_depth_np[t_depth_np>0].max():.0f}] units',
-                            fontweight='bold', color='green')
-        axes[1, 2].axis('off')
-        plt.colorbar(im3, ax=axes[1, 2], fraction=0.046)
-        
-        # Template rendered (CORRECT - should match PNG)
-        if template_depth_render is not None and (template_depth_render > 0).any():
-            im4 = axes[1, 3].imshow(template_depth_render, cmap='jet', vmin=0,
-                                     vmax=template_depth_render[template_depth_render>0].max())
-            axes[1, 3].set_title(f'Template Rendered (CORRECT)\n[{template_depth_render[template_depth_render>0].min():.0f}, {template_depth_render[template_depth_render>0].max():.0f}] units',
-                                fontweight='bold', color='green')
-            plt.colorbar(im4, ax=axes[1, 3], fraction=0.046)
-        axes[1, 3].axis('off')
-        
-        # ROW 2: VISIBILITY MAPS (only meaningful within object masks)
-        query_seen_np = query_seen_map.cpu().numpy()
-        query_not_seen_np = (q_mask.cpu().numpy() > 0.5) & (~query_seen_np)  # Within mask but not seen
-        template_seen_np = template_seen_map.cpu().numpy()
-        template_not_seen_np = template_not_seen_map.cpu().numpy()
-        
-        # Get valid pixel counts
-        q_mask_np = (q_mask.cpu().numpy() > 0.5)
-        t_mask_np = (t_depth_np > 0)
-        
-        # Query Seen Map: which query pixels (within mask) are visible in template
-        # Create RGB visualization: gray=outside mask, green=seen, black=not computed
-        query_seen_viz = np.zeros((H, W, 3))
-        query_seen_viz[~q_mask_np] = [0.3, 0.3, 0.3]  # Gray for outside mask
-        query_seen_viz[query_seen_np] = [0, 1, 0]  # Green for seen
-        query_seen_viz[query_not_seen_np] = [1, 0, 0]  # Red for not seen (within mask)
-        
-        axes[2, 0].imshow(query_seen_viz)
-        axes[2, 0].set_title(f'Query Seen Map\n{query_seen_np.sum()}/{q_mask_np.sum()} pixels visible\nGreen=Seen, Red=Occluded, Gray=Outside',
-                            fontweight='bold')
-        axes[2, 0].axis('off')
-        
-        # Query NOT seen (within mask only)
-        query_not_seen_viz = np.zeros((H, W, 3))
-        query_not_seen_viz[~q_mask_np] = [0.3, 0.3, 0.3]  # Gray for outside mask
-        query_not_seen_viz[query_not_seen_np] = [1, 0, 0]  # Red for not seen
-        query_not_seen_viz[query_seen_np] = [0, 0.5, 0]  # Dark green for seen (for reference)
-        
-        axes[2, 1].imshow(query_not_seen_viz)
-        axes[2, 1].set_title(f'Query NOT Seen (Occluded)\n{query_not_seen_np.sum()}/{q_mask_np.sum()} pixels\nRed=Occluded, Gray=Outside',
-                            fontweight='bold', color='red')
-        axes[2, 1].axis('off')
-        
-        # Template Seen Map: which template pixels have query projections
-        template_seen_viz = np.zeros((H, W, 3))
-        template_seen_viz[~t_mask_np] = [0.3, 0.3, 0.3]  # Gray for outside mask
-        template_seen_viz[template_seen_np] = [0, 1, 0]  # Green for seen
-        template_seen_viz[template_not_seen_np] = [1, 0.5, 0]  # Orange for not in query
-        
-        axes[2, 2].imshow(template_seen_viz)
-        axes[2, 2].set_title(f'Template Seen Map\n{template_seen_np.sum()}/{t_mask_np.sum()} pixels\nGreen=Has Query, Orange=No Query, Gray=Outside',
-                            fontweight='bold')
-        axes[2, 2].axis('off')
-        
-        # Template NOT Seen Map: template pixels (within mask) not in query
-        template_not_seen_viz = np.zeros((H, W, 3))
-        template_not_seen_viz[~t_mask_np] = [0.3, 0.3, 0.3]  # Gray for outside mask
-        template_not_seen_viz[template_not_seen_np] = [1, 0.5, 0]  # Orange for not in query
-        template_not_seen_viz[template_seen_np] = [0, 0.5, 0]  # Dark green for has query (for reference)
-        
-        axes[2, 3].imshow(template_not_seen_viz)
-        axes[2, 3].set_title(f'Template NOT in Query\n{template_not_seen_np.sum()}/{t_mask_np.sum()} pixels\nOrange=Not in Query, Gray=Outside',
-                            fontweight='bold', color='orange')
-        axes[2, 3].axis('off')
-        
-        # Title
-        plt.suptitle(f'[TRAIN] Object {obj_label}: Query-Template Correspondence & Visibility Maps (224x224)\n'
-                    f'Query Pose: {q_pose_np[:3, 3].astype(int)} mm | Template Pose: {t_pose_np[:3, 3].astype(int)} mm\n'
-                    f'Row 1: Depth Validation (CORRECT) | Row 2: Visibility Maps',
-                    fontsize=14, fontweight='bold')
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-        
-        # Save with unique identifier (object label + batch + template indices)
-        # Get actual template index from selection_info if available
-        save_path = f"{self.vis_dir}/train_corr_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        logger.info(f"  [TRAIN VIZ] ✓ Saved visualization to {save_path}")
-        
-        # Also create patch correspondence visualization
-        self._visualize_patch_correspondences(
-            query_data=query_data,
-            template_data=template_data,
-            q_mask=q_mask,
-            patch_has_object=patch_has_object,
-            patch_is_visible=patch_is_visible,
-            patch_flow_x=patch_flow_x,
-            patch_flow_y=patch_flow_y,
-            patch_buddy_i=patch_buddy_i,
-            patch_buddy_j=patch_buddy_j,
-            patch_center_mass_u=patch_center_mass_u,
-            patch_center_mass_v=patch_center_mass_v,
-            batch_idx=batch_idx,
-            template_idx=template_idx,
-            obj_label=obj_label,
-        )
-    
-    def _visualize_patch_correspondences(
-        self,
-        query_data,
-        template_data,
-        q_mask,
-        patch_has_object,
-        patch_is_visible,
-        patch_flow_x,
-        patch_flow_y,
-        patch_buddy_i,
-        patch_buddy_j,
-        patch_center_mass_u,
-        patch_center_mass_v,
-        batch_idx,
-        template_idx,
-        obj_label,
-    ):
-        """
-        Visualize patch-level correspondences between query and template.
-        Shows query patches (green=visible, red=not visible) and zooms into examples.
-        For template, shows 3x3 grid of patches centered on buddy patch with actual query projection.
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-        import matplotlib.patches as mpatches
-        
-        ps = self.patch_size
-        H_p = self.num_patches_per_side
-        
-        # Get RGB images
-        q_rgb = query_data.centered_rgb[batch_idx].cpu().permute(1, 2, 0).numpy()
-        t_rgb = template_data.rgb[batch_idx, template_idx].cpu().permute(1, 2, 0).numpy()
-        
-        # Create figure with patch visualization + 3 zoom examples
-        fig = plt.figure(figsize=(24, 16))
-        gs = fig.add_gridspec(4, 4, hspace=0.3, wspace=0.3)
-        
-        # ===== ROW 0: Query and Template with patch boxes =====
-        ax_query = fig.add_subplot(gs[0, 0:2])
-        ax_template = fig.add_subplot(gs[0, 2:4])
-        
-        # Query with patch boxes
-        ax_query.imshow(np.clip(q_rgb, 0, 1))
-        ax_query.set_title(f'Query Patches (Obj {obj_label})\nGreen=Visible, Red=Occluded, No box=No object',
-                          fontsize=12, fontweight='bold')
-        ax_query.axis('off')
-        
-        # Draw patch boxes on query
-        for i_p in range(H_p):
-            for j_p in range(H_p):
-                if patch_has_object[i_p, j_p]:
-                    y_start, x_start = i_p * ps, j_p * ps
-                    
-                    if patch_is_visible[i_p, j_p]:
-                        color = 'green'
-                        linewidth = 2
-                    else:
-                        color = 'red'
-                        linewidth = 1
-                    
-                    rect = Rectangle((x_start, y_start), ps, ps,
-                                   linewidth=linewidth, edgecolor=color, facecolor='none')
-                    ax_query.add_patch(rect)
-        
-        # Template with patch boxes
-        ax_template.imshow(np.clip(t_rgb, 0, 1))
-        ax_template.set_title(f'Template Patches\nShowing buddy patches for visible query patches',
-                             fontsize=12, fontweight='bold')
-        ax_template.axis('off')
-        
-        # Draw buddy patch boxes on template (only for visible query patches)
-        for i_p in range(H_p):
-            for j_p in range(H_p):
-                if patch_has_object[i_p, j_p] and patch_is_visible[i_p, j_p]:
-                    buddy_i = patch_buddy_i[i_p, j_p].item()
-                    buddy_j = patch_buddy_j[i_p, j_p].item()
-                    
-                    y_start, x_start = buddy_i * ps, buddy_j * ps
-                    
-                    rect = Rectangle((x_start, y_start), ps, ps,
-                                   linewidth=2, edgecolor='blue', facecolor='none', alpha=0.7)
-                    ax_template.add_patch(rect)
-        
-        # ===== ROW 1-3: Zoom into 3 randomly sampled patches =====
-        # Find visible patches and randomly sample 3 of them
-        visible_patches = torch.nonzero(patch_is_visible, as_tuple=False)
-        
-        if len(visible_patches) > 0:
-            # Randomly sample up to 3 patches
-            num_samples = min(3, len(visible_patches))
-            
-            # Random sampling without replacement
-            perm = torch.randperm(len(visible_patches))[:num_samples]
-            sampled_patches = visible_patches[perm]  # [num_samples, 2]
-            
-            # For first sample (to maintain variable names below)
-            sample_i, sample_j = sampled_patches[0]
-            sample_i, sample_j = sample_i.item(), sample_j.item()
-            
-            # Visualize each sampled patch
-            for idx in range(num_samples):
-                sample_i, sample_j = sampled_patches[idx]
-                sample_i, sample_j = sample_i.item(), sample_j.item()
-                
-                buddy_i = patch_buddy_i[sample_i, sample_j].item()
-                buddy_j = patch_buddy_j[sample_i, sample_j].item()
-                
-                flow_x_px = patch_flow_x[sample_i, sample_j].item() * ps
-                flow_y_px = patch_flow_y[sample_i, sample_j].item() * ps
-                
-                # Get center of mass projection for this patch
-                center_mass_u = patch_center_mass_u[sample_i, sample_j].item()
-                center_mass_v = patch_center_mass_v[sample_i, sample_j].item()
-                
-                # Extract query patch
-                q_y_start, q_y_end = sample_i * ps, (sample_i + 1) * ps
-                q_x_start, q_x_end = sample_j * ps, (sample_j + 1) * ps
-                q_patch = q_rgb[q_y_start:q_y_end, q_x_start:q_x_end]
-                
-                # Extract 3x3 template patches centered on buddy patch
-                # Clamp to valid range
-                H_t, W_t = t_rgb.shape[:2]
-                t_y_start_3x3 = max(0, (buddy_i - 1) * ps)
-                t_y_end_3x3 = min(H_t, (buddy_i + 2) * ps)
-                t_x_start_3x3 = max(0, (buddy_j - 1) * ps)
-                t_x_end_3x3 = min(W_t, (buddy_j + 2) * ps)
-                t_patch_3x3 = t_rgb[t_y_start_3x3:t_y_end_3x3, t_x_start_3x3:t_x_end_3x3]
-                
-                row = idx + 1  # Start from row 1 (row 0 has full images)
-                
-                # Query patch zoom
-                ax_q_zoom = fig.add_subplot(gs[row, 0])
-                ax_q_zoom.imshow(np.clip(q_patch, 0, 1))
-                # Mark center
-                q_center = ps // 2
-                ax_q_zoom.plot(q_center, q_center, 'r+', markersize=20, markeredgewidth=3)
-                ax_q_zoom.set_title(f'Sample {idx+1}: Query Patch [{sample_i},{sample_j}]\nCenter marked with red +',
-                                   fontsize=10, fontweight='bold')
-                ax_q_zoom.axis('off')
-                
-                # Template 3x3 patches with buddy in center
-                ax_t_zoom = fig.add_subplot(gs[row, 1])
-                ax_t_zoom.imshow(np.clip(t_patch_3x3, 0, 1))
-                
-                # Mark buddy patch center (in 3x3 grid coords)
-                # Buddy patch is at position [buddy_i, buddy_j] in original grid
-                # In 3x3 crop, it's offset by the crop start
-                buddy_center_x_in_crop = (buddy_j * ps + ps // 2) - t_x_start_3x3
-                buddy_center_y_in_crop = (buddy_i * ps + ps // 2) - t_y_start_3x3
-                ax_t_zoom.plot(buddy_center_x_in_crop, buddy_center_y_in_crop, 'b+', markersize=20, markeredgewidth=3)
-                
-                # Mark where query center actually projects (center of mass)
-                query_proj_x_in_crop = center_mass_u - t_x_start_3x3
-                query_proj_y_in_crop = center_mass_v - t_y_start_3x3
-                ax_t_zoom.plot(query_proj_x_in_crop, query_proj_y_in_crop, 'rx', markersize=15, markeredgewidth=3)
-                
-                # Draw grid lines to show patch boundaries
-                for i in range(1, 3):
-                    y_line = i * ps - (buddy_i - 1) * ps if buddy_i > 0 else i * ps
-                    if 0 <= y_line <= t_patch_3x3.shape[0]:
-                        ax_t_zoom.axhline(y=y_line, color='white', linewidth=1, alpha=0.5)
-                for j in range(1, 3):
-                    x_line = j * ps - (buddy_j - 1) * ps if buddy_j > 0 else j * ps
-                    if 0 <= x_line <= t_patch_3x3.shape[1]:
-                        ax_t_zoom.axvline(x=x_line, color='white', linewidth=1, alpha=0.5)
-                
-                # Draw box around center (buddy) patch
-                center_patch_x_start = ps if buddy_j > 0 else 0
-                center_patch_y_start = ps if buddy_i > 0 else 0
-                center_patch_rect = Rectangle(
-                    (center_patch_x_start, center_patch_y_start), ps, ps,
-                    linewidth=2, edgecolor='yellow', facecolor='none', linestyle='-'
-                )
-                ax_t_zoom.add_patch(center_patch_rect)
-                
-                ax_t_zoom.set_title(f'Template 3×3 Patches (Buddy [{buddy_i},{buddy_j}] in center)\nBlue +=buddy center, Red x=query projection, Yellow box=buddy patch',
-                                   fontsize=10, fontweight='bold')
-                ax_t_zoom.axis('off')
-                
-                # Flow visualization
-                ax_flow = fig.add_subplot(gs[row, 2])
-                ax_flow.text(0.5, 0.5, 
-                            f'Patch Correspondence:\n\n'
-                            f'Query: [{sample_i}, {sample_j}]\n'
-                            f'Template Buddy: [{buddy_i}, {buddy_j}]\n\n'
-                            f'Flow (pixels):\n'
-                            f'  Δx = {flow_x_px:.2f} px\n'
-                            f'  Δy = {flow_y_px:.2f} px\n\n'
-                            f'Flow (normalized):\n'
-                            f'  Δx = {patch_flow_x[sample_i, sample_j].item():.3f}\n'
-                            f'  Δy = {patch_flow_y[sample_i, sample_j].item():.3f}',
-                            ha='center', va='center', fontsize=10, fontfamily='monospace',
-                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                ax_flow.axis('off')
-                
-                # Empty subplot for aesthetics
-                if idx < num_samples - 1:
-                    ax_empty = fig.add_subplot(gs[row, 3])
-                    ax_empty.axis('off')
-            
-            # Statistics in last row, last column
-            ax_stats = fig.add_subplot(gs[num_samples, 3])
-            num_with_obj = patch_has_object.sum().item()
-            num_visible = patch_is_visible.sum().item()
-            num_occluded = (patch_has_object & ~patch_is_visible).sum().item()
-            
-            ax_stats.text(0.5, 0.5,
-                         f'Patch Statistics:\n\n'
-                         f'Total: {H_p}×{H_p} = {H_p*H_p}\n'
-                         f'With object: {num_with_obj}\n'
-                         f'Visible: {num_visible}\n'
-                         f'Occluded: {num_occluded}\n\n'
-                         f'Visibility:\n'
-                         f'{num_visible}/{num_with_obj}\n'
-                         f'= {100*num_visible/max(num_with_obj,1):.1f}%',
-                         ha='center', va='center', fontsize=10, fontfamily='monospace',
-                         bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
-            ax_stats.axis('off')
-        else:
-            # No visible patches
-            for row in range(1, 4):
-                for col in range(4):
-                    ax = fig.add_subplot(gs[row, col])
-                    if row == 1 and col == 0:
-                        ax.text(0.5, 0.5, 'NO VISIBLE PATCHES', ha='center', va='center',
-                               fontsize=14, color='red', fontweight='bold')
-                    ax.axis('off')
-        
-        plt.suptitle(f'[TRAIN] Object {obj_label}: Patch-Level Correspondences\n'
-                    f'Patch size: {ps}×{ps} pixels, Grid: {H_p}×{H_p} patches',
-                    fontsize=14, fontweight='bold')
-        
-        # Save with unique identifier
-        obj_label = query_data.infos.label[batch_idx]
-        Path(self.vis_dir).mkdir(parents=True, exist_ok=True)
-        save_path = f"{self.vis_dir}/train_patches_obj{obj_label}_b{batch_idx}_t{template_idx}.png"
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()        
-        logger.info(f"  [TRAIN VIZ] ✓ Saved patch visualization to {save_path}")
-    
     def compute_flow_labels_for_train(
         self,
         query_data: tc.PandasTensorCollection,
@@ -2267,6 +1435,8 @@ class VPOGDataset:
                 bboxes=query_data.bboxes,              # Cropping boxes
                 query_depth=query_data.depth,          # Cropped query depth
                 template_depth=template_data.depth,    # Cropped template depth
+                M_query=query_data.M,                  # [B, 3, 3] Crop transformation matrix
+                K_original_query=query_data.K_original,  # [B, 3, 3] Original intrinsics before crop
             )
         
             return vpog_batch
@@ -2301,7 +1471,7 @@ if __name__ == "__main__":
     
     # Setup paths
     SEED = 2  # Fixed seed for reproducible test
-    save_dir = project_root / "tmp" / "vpog_dataset_test_training"
+    save_dir = project_root / "tmp" / "vpog_dataset_test_training_6points_lighting"
     save_dir.mkdir(parents=True, exist_ok=True)
     
     # Define datasets to test
@@ -2360,8 +1530,8 @@ if __name__ == "__main__":
                 dataset_name=dataset_name,
                 template_config=template_config,
                 mode='train' if test_config['is_train'] else 'val',
-                num_positive_templates=3,
-                num_negative_templates=2,
+                num_positive_templates=5,
+                num_negative_templates=0,
                 min_negative_angle_deg=90.0,
                 d_ref_random_ratio=0.0,
                 patch_size=16,

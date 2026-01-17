@@ -8,8 +8,9 @@ root_dir: ${machine.root_dir}/datasets
 dataloader:
   _target_: training.dataloader.vpog_dataset.VPOGDataset
   mode: val
+  subsample_dataset: 10
   root_dir: ${data_val.root_dir}
-  dataset_name: ycbv  # Override via val_dataset_name in train.yaml
+  dataset_name: ycbv  # NOTE! if used as valiadtion, this is overridden via val_dataset_name in train.yaml
   depth_scale: 10.0
   
   # Template configuration
@@ -23,7 +24,7 @@ dataloader:
     pose_name: object_poses/OBJECT_ID.npy
   
   # Template selection
-  num_positive_templates: 8
+  num_positive_templates: 162
   num_negative_templates: 0
   
   # Image/patch settings

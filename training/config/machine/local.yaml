@@ -10,18 +10,21 @@ gpus: 1
 # Root directory
 root_dir: /data/home/ssaricha/gigapose
 
+# Logger backend (tensorboard or wandb)
+logger_backend: tensorboard
+
 # Callbacks
 callbacks:
   checkpoint:
     _target_: pytorch_lightning.callbacks.ModelCheckpoint
     dirpath: ${checkpoint_dir}
-    filename: '{epoch:03d}-{val_loss:.4f}'
+    filename: '{epoch:03d}-{step}-{val/loss_total:.4f}'
     save_top_k: 3
     save_last: true
-    monitor: val_loss
+    monitor: val/loss_total
     mode: min
-    every_n_epochs: 1
-    save_on_train_epoch_end: true
+    # No every_n_epochs means: check every time val/loss_total is logged (every validation)
+    save_on_train_epoch_end: false  # Save after validation completes
     verbose: true
   
   lr_monitor:
@@ -37,11 +40,9 @@ trainer:
   log_every_n_steps: ${log_every_n_steps}
   val_check_interval: ${val_check_interval}
   precision: 16-mixed  # Use mixed precision training
-  gradient_clip_val: 5.0  # Increased from 1.0 to handle larger gradients
-  gradient_clip_algorithm: norm
+  gradient_clip_val: 1.0
   accumulate_grad_batches: 1
   num_sanity_val_steps: 0 #2
-  detect_anomaly: false  # Set to true for debugging NaNs (slows training)
   
   # Logging
   enable_checkpointing: true

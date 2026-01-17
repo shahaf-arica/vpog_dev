@@ -11,7 +11,7 @@ defaults:
 
 # Experiment settings
 save_dir: /strg/E/shared-data/Shahaf/gigapose/outputs
-name_exp: vpog_train_dev_5
+name_exp: vpog_train_dev_6
 seed: 42
 
 # Logging configuration
@@ -33,17 +33,21 @@ train_dataset_names:
   1: [shapenet]
   2: [gso, shapenet]
 
-# Validation dataset name (override: data_val.dataloader.dataset_name=tless)
+# Validation dataset name - SINGLE SOURCE OF TRUTH
+# This controls both:
+#   1. Which BOP dataset is loaded for validation (data_val)
+#   2. Which BOP models/symmetries are used for pose evaluation
+# Override via command line: python train.py val_dataset_name=tless
 val_dataset_name: ycbv
 
 # Training parameters
 max_epochs: 1
 log_every_n_steps: 50
-val_check_interval: 1.0  # Validate every epoch
+val_check_interval: 10000  # Set to null to disable validation, or 1.0 to validate every epoch
 
-# Checkpoint settings
-checkpoint_dir: ${save_dir}/${name_exp}/checkpoints
-vis_dir: ${save_dir}/${name_exp}/visualizations
+# Checkpoint settings (per-run directories under hydra's output_dir)
+checkpoint_dir: ${hydra:runtime.output_dir}/checkpoints
+vis_dir: ${hydra:runtime.output_dir}/visualizations
 
 # Loss weights (override individual weights: loss.weights.cls=2.0)
 loss_weight_cls: ${loss.weights.cls}
@@ -53,6 +57,9 @@ loss_weight_center: ${loss.weights.center}
 
 # Resume training
 resume_from_checkpoint: null
+
+# Validation-only mode (skip training, only run validation)
+validate_only: false
 
 # Optional: limit batches for debugging
 limit_train_batches: null

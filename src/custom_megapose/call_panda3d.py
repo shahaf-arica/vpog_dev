@@ -112,6 +112,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "scale_translation", nargs="?", help="scale translation to meter"
     )
+    parser.add_argument(
+        "--point_light", nargs="?", type=float, help="point light level. if negative, use ambient light", default=-1.0
+    )
+    parser.add_argument(
+        "--ambient_light", nargs="?", type=float, help="ambient light level", default=1.0
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -137,14 +143,104 @@ if __name__ == "__main__":
     TWC = Transform(camera_pose)
     camera_data = CameraData(K=K, TWC=TWC, resolution=(480, 640))
 
-    # define light
-    light_datas = [
-        Panda3dLightData(
-            light_type="ambient",
-            color=((1.0, 1.0, 1.0, 1)),
-        ),
-    ]
+    point_light = args.point_light
+    ambient_light = args.ambient_light
 
+    if point_light < 0:
+        # define light
+        light_datas = [
+            Panda3dLightData(
+                light_type="ambient",
+                color=((ambient_light, ambient_light, ambient_light, 1)),
+            ),
+        ]
+    else:
+        def place_point_light_1(root_node, light_np):
+            # Put the light somewhere in front/above the object/camera
+            # light_np.set_pos(0.5, -0.8, 1.0)   # (x, y, z) in root_node coordinates
+            light_np.set_pos(0.0, 0.0, 5.0)   # (x, y, z) in root_node coordinates
+            light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+        def place_point_light_2(root_node, light_np):
+            # Put the light somewhere in front/above the object/camera
+            light_np.set_pos(0.0, 5.0, 0.0)   # (x, y, z) in root_node coordinates
+            light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+        def place_point_light_3(root_node, light_np):
+            # Put the light somewhere in front/above the object/camera
+            light_np.set_pos(5.0, 0.0, 0.0)   # (x, y, z) in root_node coordinates
+            light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+        def place_point_light_4(root_node, light_np):
+            # Put the light somewhere in front/above the object/camera
+            light_np.set_pos(0.0, 0.0, -5.0)   # (x, y, z) in root_node coordinates
+            light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+        def place_point_light_5(root_node, light_np):
+            # Put the light somewhere in front/above the object/camera
+            light_np.set_pos(0.0, -5.0, 0.0)   # (x, y, z) in root_node coordinates
+            light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+        def place_point_light_6(root_node, light_np):
+            # Put the light somewhere in front/above the object/camera
+            light_np.set_pos(-5.0, 0.0, 0.0)   # (x, y, z) in root_node coordinates
+            light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+        light_datas = [
+            Panda3dLightData(
+                light_type="ambient",
+                color=(ambient_light, ambient_light, ambient_light, 1), # 0.7, 0.7, 0.7, 1
+            ),
+            Panda3dLightData(
+                light_type="point",
+                color=(point_light, point_light, point_light, 1), # 0.8, 0.8, 0.8, 1
+                positioning_function=place_point_light_1,
+            ),
+            Panda3dLightData(
+                light_type="point",
+                color=(point_light, point_light, point_light, 1), # 0.8, 0.8, 0.8, 1
+                positioning_function=place_point_light_2,
+            ),
+            Panda3dLightData(
+                light_type="point",
+                color=(point_light, point_light, point_light, 1), # 0.8, 0.8, 0.8, 1
+                positioning_function=place_point_light_3,
+            ),
+            Panda3dLightData(
+                light_type="point",
+                color=(point_light, point_light, point_light, 1), # 0.8, 0.8, 0.8, 1
+                positioning_function=place_point_light_4,
+            ),
+            Panda3dLightData(
+                light_type="point",
+                color=(point_light, point_light, point_light, 1), # 0.8, 0.8, 0.8, 1
+                positioning_function=place_point_light_5,
+            ),
+            Panda3dLightData(
+                light_type="point",
+                color=(point_light, point_light, point_light, 1), # 0.8, 0.8, 0.8, 1
+                positioning_function=place_point_light_6,
+            ),
+        ]
+
+    # def place_point_light(root_node, light_np):
+    #         # Put the light somewhere in front/above the object/camera
+    #         light_np.set_pos(0.5, -0.8, 1.0)   # (x, y, z) in root_node coordinates
+    #         light_np.look_at(0, 0, 0)          # aim toward origin (optional for point)
+
+    # light_datas = [
+    #     Panda3dLightData(
+    #         light_type="ambient",
+    #         color=(0.7, 0.7, 0.7, 1), # 0.7, 0.7, 0.7, 1
+    #     ),
+    #     Panda3dLightData(
+    #         light_type="point",
+    #         color=(0.8, 0.8, 0.8, 1), # 0.8, 0.8, 0.8, 1
+    #         positioning_function=place_point_light,
+    #     ),
+    # ]
+
+    
     # load object poses
     object_poses = np.load(args.obj_pose)
     if mesh_units == "m" or args.scale_translation == "true":

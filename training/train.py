@@ -68,23 +68,37 @@ def setup_callbacks(cfg: DictConfig):
     """Setup training callbacks from config.
     
     Uses Hydra's instantiate to create callbacks from the machine config.
-    Callbacks are defined in machine.callbacks (e.g., local.yaml, slurm.yaml).
+    Automatically selects appropriate checkpoint strategy based on validation.
     """
     from hydra.utils import instantiate
     
     callbacks = []
+    has_validation = cfg.get('val_check_interval') is not None
     
     if 'callbacks' in cfg.machine:
         for callback_name, callback_cfg in cfg.machine.callbacks.items():
             if callback_cfg is not None and '_target_' in callback_cfg:
-                # Handle special case for checkpoint callback when no validation
-                if callback_name == 'checkpoint' and not cfg.get('val_check_interval'):
-                    # Override monitor to None and filename format
-                    callback_cfg = OmegaConf.to_container(callback_cfg, resolve=True)
-                    callback_cfg['monitor'] = None
-                    callback_cfg['filename'] = '{epoch:03d}'
-                    callback = instantiate(callback_cfg)
+                # Smart checkpoint selection
+                if callback_name == 'checkpoint':
+                    if has_validation:
+                        # Use validation-based checkpoint
+                        callback = instantiate(callback_cfg)
+                        logger.info(f"Checkpoint: save top-{callback_cfg.save_top_k} by {callback_cfg.monitor}")
+                    else:
+                        # Skip this one, will use checkpoint_no_val
+                        continue
+                
+                elif callback_name == 'checkpoint_no_val':
+                    if not has_validation:
+                        # Use epoch-based checkpoint
+                        callback = instantiate(callback_cfg)
+                        logger.info(f"Checkpoint: save every {callback_cfg.every_n_epochs} epoch(s) (no validation)")
+                    else:
+                        # Skip this one, using regular checkpoint
+                        continue
+                
                 else:
+                    # Other callbacks (lr_monitor, etc.)
                     callback = instantiate(callback_cfg)
                 
                 callbacks.append(callback)
@@ -92,7 +106,6 @@ def setup_callbacks(cfg: DictConfig):
     
     if not callbacks:
         logger.warning("No callbacks configured! Using defaults.")
-        # Fallback to basic checkpoint callback
         callbacks.append(ModelCheckpoint(
             dirpath=cfg.checkpoint_dir,
             save_last=True,
@@ -207,12 +220,13 @@ def setup_dataloaders(cfg: DictConfig):
     Training:
     - Use train_dataset_id to select dataset(s): 0=gso, 1=shapenet, 2=both
     - Iterate over list and create dataloader for each dataset
+    - Skip if validate_only=True to save time
     
     Validation:
     - Use generic BOP config with dataset_name override
     
     Returns:
-        train_dataloaders: List of training dataloaders (one or multiple)
+        train_dataloaders: List of training dataloaders (one or multiple) or None if validate_only
         val_dataloader: Validation dataloader (optional)
     """
     from hydra.utils import instantiate
@@ -222,35 +236,41 @@ def setup_dataloaders(cfg: DictConfig):
     batch_size = cfg.machine.batch_size
     num_workers = cfg.machine.num_workers
     
-    # --- Training Dataloaders (gigapose pattern) ---
-    selected_train_dataset_names = cfg.train_dataset_names[cfg.train_dataset_id]
-    logger.info(f"Training datasets: {selected_train_dataset_names}")
-    
+    # --- Training Dataloaders (skip if validate_only) ---
     train_dataloaders = []
-    for dataset_name in selected_train_dataset_names:
-        logger.info(f"\n  Loading training dataset: {dataset_name}")
+    
+    if not cfg.get('validate_only', False):
+        selected_train_dataset_names = cfg.train_dataset_names[cfg.train_dataset_id]
+        logger.info(f"Training datasets: {selected_train_dataset_names}")
         
-        # Set dataset name in the config
-        cfg.data_train.dataloader.dataset_name = dataset_name
-        dataset = instantiate(cfg.data_train.dataloader)
-        
-        dataloader = NoneFilteringDataLoader(
-            dataset.web_dataloader,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            collate_fn=dataset.collate_fn,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=num_workers > 0,
-        )
-        
-        train_dataloaders.append(dataloader)
-        # logger.info(f"    Loaded {len(dataset)} samples")
+        for dataset_name in selected_train_dataset_names:
+            logger.info(f"\n  Loading training dataset: {dataset_name}")
+            
+            # Set dataset name in the config
+            cfg.data_train.dataloader.dataset_name = dataset_name
+            dataset = instantiate(cfg.data_train.dataloader)
+            
+            dataloader = NoneFilteringDataLoader(
+                dataset.web_dataloader,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                collate_fn=dataset.collate_fn,
+                pin_memory=True,
+                drop_last=True,
+                persistent_workers=num_workers > 0,
+            )
+            
+            train_dataloaders.append(dataloader)
+            # logger.info(f"    Loaded {len(dataset)} samples")
+    else:
+        logger.info("Skipping training dataset loading (validate_only=True)")
+        train_dataloaders = None
     
     # --- Validation Dataloader (BOP dataset) ---
     val_dataloader = None
     
-    if cfg.get('val_check_interval'):
+    # Load validation if: val_check_interval is set OR validate_only mode
+    if cfg.get('val_check_interval') or cfg.get('validate_only', False):
         val_batch_size = cfg.machine.get('val_batch_size', 1)
         logger.info(f"\nLoading validation dataset: {cfg.val_dataset_name}")
         # logger.info(f"  Validation batch size: {val_batch_size}")
@@ -384,6 +404,9 @@ def create_vpog_model(cfg: DictConfig):
         use_param_groups=optimizer_cfg.get('use_param_groups', False),
         backbone_lr_multiplier=optimizer_cfg.get('param_groups', {}).get('backbone', {}).get('lr_multiplier', 0.1),
         new_components_lr_multiplier=optimizer_cfg.get('param_groups', {}).get('new_components', {}).get('lr_multiplier', 1.0),
+        # BOP evaluation parameters (uses val_dataset_name from train.yaml)
+        enable_pose_eval=cfg.model.get('enable_pose_eval', True),
+        dataset_name=cfg.val_dataset_name,
     )
     
     logger.info(f"  Model parameters: {sum(p.numel() for p in vpog_model.parameters()) / 1e6:.2f}M")
@@ -434,6 +457,42 @@ def main(cfg: DictConfig):
     logger_backend = setup_logger_backend(cfg)
     trainer = setup_trainer(cfg, callbacks, logger_backend)
     
+    # Check if validation-only mode BEFORE loading datasets
+    if cfg.get('validate_only', False):
+        logger.info("\n" + "="*80)
+        logger.info("Validation-Only Mode - Loading only validation dataset")
+        logger.info("="*80)
+        
+        # Only load validation dataloader
+        train_dataloaders = None
+        _, val_dataloader = setup_dataloaders(cfg)
+        
+        # Setup model
+        model = create_vpog_model(cfg)
+        if val_dataloader is None:
+            logger.error("Cannot run validation-only mode without validation dataloader!")
+            logger.error("Set val_check_interval to enable validation.")
+            return
+        
+        ckpt_path = cfg.get('resume_from_checkpoint')
+        if ckpt_path:
+            logger.info(f"Loading checkpoint: {ckpt_path}")
+        else:
+            logger.warning("No checkpoint specified - validating with random initialized weights!")
+            logger.warning("Use: resume_from_checkpoint=/path/to/checkpoint.ckpt")
+        
+        trainer.validate(model, dataloaders=val_dataloader, ckpt_path=ckpt_path)
+        
+        logger.info("\n" + "="*80)
+        logger.info("Validation completed!")
+        logger.info("="*80)
+        return
+    
+    # Normal training mode - load all datasets
+    logger.info("\n" + "="*80)
+    logger.info("Training Mode - Loading training datasets")
+    logger.info("="*80)
+    
     # Setup dataloaders (supports multi-dataset training)
     train_dataloaders, val_dataloader = setup_dataloaders(cfg)
     
@@ -444,6 +503,13 @@ def main(cfg: DictConfig):
     logger.info("\n" + "="*80)
     logger.info("Training")
     logger.info("="*80)
+    
+    # Run full validation before training starts (if enabled)
+    if val_dataloader is not None:
+        logger.info("\n" + "="*80)
+        logger.info("Running initial validation...")
+        logger.info("="*80)
+        trainer.validate(model, dataloaders=val_dataloader)
     
     try:
         trainer.fit(

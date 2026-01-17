@@ -11,6 +11,7 @@ from bop_toolkit_lib import inout
 
 from src.lib3d.template_transform import get_obj_poses_from_template_level
 from src.utils.logging import get_logger
+from tqdm import tqdm
 
 logger = get_logger(__name__)
 
@@ -35,11 +36,14 @@ def call_panda3d(
 
     gpus_device = idx_obj % num_gpus
     os.makedirs(output_dir, exist_ok=True)
-    command = f"python -m src.custom_megapose.call_panda3d {cad_path} {obj_pose_path} {output_dir} {gpus_device}"
+    ambient_light = 0.2
+    point_light = 0.4
+    command = f"python -m src.custom_megapose.call_panda3d --point_light {point_light} --ambient_light {ambient_light} {cad_path} {obj_pose_path} {output_dir} {gpus_device}"
     if disable_output:
         command += " true"
     else:
         command += " false"
+    # print(command)
     os.system(command)
 
     # make sure the number of rendered images is correct
@@ -82,10 +86,20 @@ def render(cfg) -> None:
     logger.info(f"Rendering {len(model_infos)} models!")
     cad_dir = root_dir / "shapenet/models"
 
-    root_save_dir = root_dir / "templates/shapenet"
+    root_save_dir = root_dir / "templates/shapenet_1_light_point"
+    # root_save_dir = root_dir / "templates/shapenet"
     os.makedirs(root_save_dir, exist_ok=True)
-    os.makedirs(root_save_dir / "object_poses", exist_ok=True)
-    os.makedirs(root_save_dir / "object_poses_with_offset", exist_ok=True)
+    if os.path.exists(root_save_dir / "object_poses"):
+        os.makedirs(root_save_dir / "object_poses", exist_ok=True)
+        os.makedirs(root_save_dir / "object_poses_with_offset", exist_ok=True)
+        templates_dirs = glob.glob(f"{root_save_dir}/*")
+        templates_dirs.sort()
+        templates_dirs = [d for d in templates_dirs if not "object" in d]
+        empty_dirs = []
+        for d in tqdm(templates_dirs, desc="Checking existing template dirs"):
+            if len(glob.glob(f"{d}/*")) < 324:
+                empty_dirs.append(d)
+    empty_dirs_set = set(empty_dirs)
     template_poses = get_obj_poses_from_template_level(level=1, pose_distribution="all")
 
     if cfg.start_idx is None:
@@ -104,6 +118,9 @@ def render(cfg) -> None:
 
         else:
             obj_id = model_info["obj_id"]
+            # obj_dir_name = f"{obj_id:06d}"
+            # if obj_dir_name in dirs_name_to_skip:
+            #     continue
             cat_id = model_info["shapenet_synset_id"]
             cad_id = model_info["shapenet_source_id"]
             cad_name = f"{cat_id}/{cad_id}/models/model_normalized_binormals.bam"
@@ -123,9 +140,13 @@ def render(cfg) -> None:
             obj_pose_with_offset_path = (
                 f"{root_save_dir}/object_poses_with_offset/{obj_id:06d}.npy"
             )
-            np.save(obj_pose_with_offset_path, obj_poses)
             output_dir = f"{root_save_dir}/{obj_id:06d}"
 
+            if not output_dir in empty_dirs_set and os.path.exists(output_dir):
+                continue
+
+            np.save(obj_pose_with_offset_path, obj_poses)
+            
             list_cad_paths.append(cad_path)
             list_obj_pose_paths.append(obj_pose_with_offset_path)
             list_output_dirs.append(output_dir)

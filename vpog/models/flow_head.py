@@ -86,26 +86,26 @@ def pack_valid_qt_pairs(
     b_idx, s_idx, q_idx = valid.nonzero(as_tuple=True)  # each [M]
 
     ############# for DEBUGGING
-    HW = q_tokens.shape[1]   # 196
-    Nt = t_tokens.shape[2]   # 196 or 197
+    # HW = q_tokens.shape[1]   # 196
+    # Nt = t_tokens.shape[2]   # 196 or 197
 
-    # q_idx must always be in [0, HW-1]
-    if not ((q_idx >= 0).all() and (q_idx < HW).all()):
-        bad = ~((q_idx >= 0) & (q_idx < HW))
-        m = int(bad.nonzero(as_tuple=False)[0].item())
-        raise RuntimeError(f"[NaN DEBUG] q_idx out of range at m={m}: q_idx={int(q_idx[m])}, HW={HW}")
+    # # q_idx must always be in [0, HW-1]
+    # if not ((q_idx >= 0).all() and (q_idx < HW).all()):
+    #     bad = ~((q_idx >= 0) & (q_idx < HW))
+    #     m = int(bad.nonzero(as_tuple=False)[0].item())
+    #     raise RuntimeError(f"[NaN DEBUG] q_idx out of range at m={m}: q_idx={int(q_idx[m])}, HW={HW}")
 
-    # t_idx is derived from patch_cls; compute it explicitly here for debug
-    t_idx = patch_cls[b_idx, s_idx, q_idx]  # [M] long
+    # # t_idx is derived from patch_cls; compute it explicitly here for debug
+    # t_idx = patch_cls[b_idx, s_idx, q_idx]  # [M] long
 
-    if not ((t_idx >= 0).all() and (t_idx < Nt).all()):
-        bad = ~((t_idx >= 0) & (t_idx < Nt))
-        m = int(bad.nonzero(as_tuple=False)[0].item())
-        raise RuntimeError(f"[NaN DEBUG] t_idx out of range at m={m}: t_idx={int(t_idx[m])}, Nt={Nt}")
-    # This is diagnostic only:
-    num_unseen = int((t_idx == HW).sum().item()) if Nt == HW + 1 else 0
-    if num_unseen > 0:
-        print(f"[NaN DEBUG] pack_valid_qt_pairs: unseen pairs included: {num_unseen}/{t_idx.numel()} (t_idx==HW)")
+    # if not ((t_idx >= 0).all() and (t_idx < Nt).all()):
+    #     bad = ~((t_idx >= 0) & (t_idx < Nt))
+    #     m = int(bad.nonzero(as_tuple=False)[0].item())
+    #     raise RuntimeError(f"[NaN DEBUG] t_idx out of range at m={m}: t_idx={int(t_idx[m])}, Nt={Nt}")
+    # # This is diagnostic only:
+    # num_unseen = int((t_idx == HW).sum().item()) if Nt == HW + 1 else 0
+    # if num_unseen > 0:
+    #     print(f"[NaN DEBUG] pack_valid_qt_pairs: unseen pairs included: {num_unseen}/{t_idx.numel()} (t_idx==HW)")
     #############
 
     if b_idx.numel() == 0:
@@ -131,18 +131,18 @@ def pack_valid_qt_pairs(
     t_tok = t_tokens[b_idx, s_idx, t_idx]
 
     ############ DEBUGGING
-    assert_finite("packed q_tok", q_tok)
-    assert_finite("packed t_tok", t_tok)
+    # assert_finite("packed q_tok", q_tok)
+    # assert_finite("packed t_tok", t_tok)
 
-    # Pinpoint first bad packed row and print its mapping
-    bad_m_q = first_bad_row(q_tok)
-    bad_m_t = first_bad_row(t_tok)
-    if bad_m_q is not None or bad_m_t is not None:
-        m = bad_m_q if bad_m_q is not None else bad_m_t
-        print("[NaN DEBUG] BAD packed row m=", m)
-        print("  b_idx,s_idx,q_idx,t_idx =",
-            int(b_idx[m]), int(s_idx[m]), int(q_idx[m]), int(t_idx[m]))
-        raise RuntimeError("[NaN DEBUG] Non-finite token after gather in pack_valid_qt_pairs")
+    # # Pinpoint first bad packed row and print its mapping
+    # bad_m_q = first_bad_row(q_tok)
+    # bad_m_t = first_bad_row(t_tok)
+    # if bad_m_q is not None or bad_m_t is not None:
+    #     m = bad_m_q if bad_m_q is not None else bad_m_t
+    #     print("[NaN DEBUG] BAD packed row m=", m)
+    #     print("  b_idx,s_idx,q_idx,t_idx =",
+    #         int(b_idx[m]), int(s_idx[m]), int(q_idx[m]), int(t_idx[m]))
+    #     raise RuntimeError("[NaN DEBUG] Non-finite token after gather in pack_valid_qt_pairs")
     #######################
 
     return {
@@ -170,14 +170,24 @@ def _make_mlp(in_dim: int, hidden_dims: Tuple[int, ...], dropout: float, use_lay
     return nn.Sequential(*layers)
 
 
+# def _fuse_qt_packed(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+#     """
+#     Packed fusion.
+#       q: [M,C]
+#       t: [M,C]
+#     returns: [M,4C] as [q, t, q-t, q*t]
+#     """
+#     return torch.cat([q, t, q - t, q * t], dim=-1)
+
+
 def _fuse_qt_packed(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """
     Packed fusion.
       q: [M,C]
       t: [M,C]
-    returns: [M,4C] as [q, t, q-t, q*t]
+    returns: [M,2C] as [q, t]
     """
-    return torch.cat([q, t, q - t, q * t], dim=-1)
+    return torch.cat([q, t], dim=-1)
 
 
 # -------------------------
@@ -210,7 +220,7 @@ class BuddyDenseFlowHead(nn.Module):
         self.ps = int(ps)
         self.eps_b = float(eps_b)
 
-        fuse_dim = 4 * in_dim
+        fuse_dim = 2 * in_dim
         self.backbone = _make_mlp(
             in_dim=fuse_dim,
             hidden_dims=hidden_dims,
@@ -250,7 +260,7 @@ class BuddyDenseFlowHead(nn.Module):
             empty_w = q_tok.new_empty((0, self.ps, self.ps))
             return empty_flow, empty_b, empty_w
 
-        fused = _fuse_qt_packed(q_tok, t_tok)  # [M,4C]
+        fused = _fuse_qt_packed(q_tok, t_tok)  # [M,2C]
 
         ############# for DEBUGGING
         assert_finite("dense_head fused", fused)
@@ -300,7 +310,7 @@ class CenterFlowHead(nn.Module):
         use_layernorm: bool = True,
     ):
         super().__init__()
-        fuse_dim = 4 * in_dim
+        fuse_dim = 2 * in_dim
         self.backbone = _make_mlp(fuse_dim, hidden_dims, dropout, use_layernorm)
         last_dim = hidden_dims[-1] if len(hidden_dims) > 0 else fuse_dim
 
